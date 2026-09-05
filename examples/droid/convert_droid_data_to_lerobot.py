@@ -239,7 +239,7 @@ class MP4Reader:
         return self.resize_func(frame, self.resolution)
 
     def read_camera(self, ignore_data=False, correct_timestamp=None):  # noqa: FBT002
-        # Skip if Read Unnecessary #
+        # Skip if Read Unnecesary #
         if self.skip_reading:
             return {}
 

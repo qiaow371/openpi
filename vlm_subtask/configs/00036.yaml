@@ -1,0 +1,12 @@
+dataset_id: "00036"
+task: >-
+  With both hands, pick up the yellow banana and the yellow lemon and put them
+  into the black box; then take the green vegetables and place them into the
+  blue box.
+subtask_templates:
+  approach: reach for the fruit
+  pick_banana_or_lemon: pick up the banana or lemon
+  place_in_black: place the fruit into the black box
+  pick_vegetables: pick up the green vegetables
+  place_in_blue: place the vegetables into the blue box
+  transit: move the {hand} arm into position

@@ -40,7 +40,8 @@ class CheckpointWeightLoader(WeightLoader):
 
     Compatible with:
       trained checkpoints:
-        example: "./checkpoints/<config>/<exp>/<step>/params"
+        example: "./checkpoints/<config>/<exp>/checkpoints/<step>/pretrained_model/params"
+        (legacy flat also works: "./checkpoints/<config>/<exp>/<step>/params")
       released checkpoints:
         example: "gs://openpi-assets/checkpoints/<model>/params"
     """
@@ -98,6 +99,12 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
     # Then, merge any missing weights as defined by the missing regex.
     pattern = re.compile(missing_regex)
     for k in {k for k in flat_ref if pattern.fullmatch(k)}:
+        if k not in result:
+            result[k] = flat_ref[k]
+    
+    # Finally, add all remaining missing keys from reference to ensure structure matches.
+    # This is important for new modules like depth_encoder that aren't in the checkpoint.
+    for k in flat_ref:
         if k not in result:
             result[k] = flat_ref[k]
 

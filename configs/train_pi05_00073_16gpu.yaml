@@ -1,0 +1,44 @@
+# jiangsuan-16 16×PPU PyTorch FSDP。路径是 openpi_train 容器内路径。
+# 对照：checkpoints/pi05_chunk_50_lr_1.0e-4_epochs_100_bs_1024_nw_4_fsdp_16_wu_2000_dlr_1.0e-5_20260819（无 subtask）
+config_name: pi05_aloha
+framework: pytorch
+exp_name: auto
+project_name: openpi
+checkpoint_base_dir: ./checkpoints
+assets_base_dir: ./assets
+batch_size: 1024
+num_epochs: 100
+seed: 42
+num_workers: 4
+log_interval: 100
+save_every_epochs: 10
+keep_period: 5000
+overwrite: false
+resume: false
+wandb_enabled: false
+fsdp_devices: 16
+ema_decay: 0.99
+pytorch_training_precision: bfloat16
+pytorch_weight_path: /workspace/openpi/models/pi05_fixed
+model:
+  action_horizon: 50
+lr_schedule:
+  warmup_steps: 2000
+  peak_lr: 1.0e-4
+  decay_lr: 1.0e-5
+optimizer:
+  b1: 0.9
+  b2: 0.95
+  eps: 1.0e-8
+  weight_decay: 1.0e-10
+  clip_gradient_norm: 1.0
+data:
+  repo_id: /workspace/openpi/datasets/00073_20260818_RM_01_yj_21
+  assets:
+    assets_dir: /workspace/openpi/datasets/00073_20260818_RM_01_yj_21
+    asset_id: "."
+  default_prompt: "Using both hands, pick up the courier items from the green conveyor belt. Place the white courier bags into the left box and the brown courier boxes into the right box."
+  prompt_from_task: true
+  prompt_from_subtask: true
+  adapt_to_pi: false
+  delta_action_dims: [7, 7, -1, -1]

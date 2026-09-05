@@ -1,0 +1,60 @@
+# TongBot 双臂 16D — OpenPI π₀.₅ 训练
+#   python scripts/train_from_yaml.py --config configs/train_pi05_tongbot.yaml
+#
+# 数据: observation.state / action = [左7 | 右7 | 左爪 | 右爪]
+# 推理对齐: cigai-vla-leroboot infer/config/lerobot/pi05_openpi_dual_arm_gripper_direct.yaml
+
+config_name: pi05_aloha
+framework: jax
+
+exp_name: 00031_PI05_bs64_ah50_wd1.0e-6_ly
+project_name: openpi
+checkpoint_base_dir: /data/outputs
+assets_base_dir: ./assets
+
+batch_size: 64
+num_epochs: 100
+seed: 42
+num_workers: 2
+log_interval: 100
+save_every_epochs: 1
+# 完整 train_state 隔 5 个 epoch 存一次；平时只存推理 params
+save_full_every_epochs: 5
+keep_period: 5000
+overwrite: false
+resume: true
+wandb_enabled: false
+fsdp_devices: 1
+ema_decay: 0.99
+
+pytorch_training_precision: bfloat16
+pytorch_weight_path:
+
+
+model:
+  action_horizon: 50
+
+
+lr_schedule:
+  warmup_steps: 1000
+  peak_lr: 2.5e-5
+  decay_lr: 2.5e-6
+
+optimizer:
+  b1: 0.9
+  b2: 0.95
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+  clip_gradient_norm: 1.0
+
+data:
+  repo_id: /home/xk/dataset/00031_20260729_RM_01_yj_aloha_v21
+  assets:
+    assets_dir: 
+    asset_id: "."
+  default_prompt: "Use the left arm to sort: put the red horse into the yellow box and the brown horse into the blue box."
+  prompt_from_task: true
+  prompt_from_subtask: true
+  adapt_to_pi: false
+  use_delta_joint_actions: true
+  delta_action_dims: [7, 7, -1, -1]

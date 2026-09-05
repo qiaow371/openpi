@@ -45,6 +45,8 @@ import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+import openpi.training.schedule as _schedule
+import openpi.training.train_log as _train_log
 
 
 def init_logging():
@@ -153,21 +155,26 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
 
     # Only save if it's time to save or if it's the final step
     if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
-        # Create temporary directory for atomic checkpoint saving
-        final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
-        tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
+        step_dir = _train_log.get_step_checkpoint_dir(config.checkpoint_dir, config.num_train_steps, global_step)
+        pretrained_dir = _train_log.get_pretrained_model_dir(step_dir)
+        checkpoints_root = _train_log.get_checkpoints_dir(config.checkpoint_dir)
+        checkpoints_root.mkdir(parents=True, exist_ok=True)
+        tmp_ckpt_dir = checkpoints_root / f"tmp_{global_step}"
 
         # Remove any existing temp directory and create new one
         if tmp_ckpt_dir.exists():
             shutil.rmtree(tmp_ckpt_dir)
-        tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
+        tmp_pretrained = tmp_ckpt_dir / _train_log.PRETRAINED_MODEL_DIR
+        tmp_training_state = tmp_ckpt_dir / _train_log.TRAINING_STATE_DIR
+        tmp_pretrained.mkdir(parents=True, exist_ok=True)
+        tmp_training_state.mkdir(parents=True, exist_ok=True)
 
         # Save model state using safetensors (handle shared tensors)
         model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+        safetensors.torch.save_model(model_to_save, tmp_pretrained / "model.safetensors")
 
         # Save optimizer state using PyTorch format
-        torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
+        torch.save(optimizer.state_dict(), tmp_training_state / "optimizer.pt")
 
         # Save training metadata (avoid saving full config to prevent JAX/Flax compatibility issues)
         metadata = {
@@ -175,38 +182,47 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             "config": dataclasses.asdict(config),
             "timestamp": time.time(),
         }
-        torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
+        torch.save(metadata, tmp_training_state / "metadata.pt")
 
-        # save norm stats
         norm_stats = data_config.norm_stats
-        if norm_stats is not None and data_config.asset_id is not None:
-            _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
+        if norm_stats is not None:
+            _normalize.save(tmp_ckpt_dir / "assets", norm_stats)
+
+        try:
+            _train_log.save_policy_config(tmp_pretrained, config)
+            _train_log.save_train_config(tmp_pretrained, config)
+        except Exception:
+            logging.exception("Failed to write config files into checkpoint bundle")
 
         # Atomically move temp directory to final location
-        if final_ckpt_dir.exists():
-            shutil.rmtree(final_ckpt_dir)
-        tmp_ckpt_dir.rename(final_ckpt_dir)
+        if step_dir.exists():
+            shutil.rmtree(step_dir)
+        tmp_ckpt_dir.rename(step_dir)
+        _train_log.update_checkpoint_link(step_dir, _train_log.LAST_CHECKPOINT_LINK)
 
-        logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
+        logging.info(f"Saved checkpoint at step {global_step} -> {pretrained_dir}")
+        logging.info(f"Checkpoint policy after step {global_step}")
 
         # Log checkpoint to wandb
         if config.wandb_enabled:
             wandb.log({"checkpoint_step": global_step}, step=global_step)
 
 
-def load_checkpoint(model, optimizer, checkpoint_dir, device):
+def load_checkpoint(model, optimizer, checkpoint_dir, device, *, total_steps: int | None = None):
     """Load the latest checkpoint and return the global step."""
-    checkpoint_steps = [
-        int(d.name)
-        for d in checkpoint_dir.iterdir()
-        if d.is_dir() and d.name.isdigit() and not d.name.startswith("tmp_")
-    ]
-
+    checkpoint_steps = _train_log.list_checkpoint_steps(checkpoint_dir)
     if not checkpoint_steps:
         raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
 
     latest_step = max(checkpoint_steps)
-    ckpt_dir = checkpoint_dir / f"{latest_step}"
+    step_dir = _train_log.resolve_step_dir(checkpoint_dir, latest_step, total_steps)
+    pretrained_dir = _train_log.get_pretrained_model_dir(step_dir)
+    training_state_dir = _train_log.get_training_state_dir(step_dir)
+    # Fall back to flat step dir (legacy OpenPI layout).
+    if not (pretrained_dir / "model.safetensors").exists() and (step_dir / "model.safetensors").exists():
+        pretrained_dir = step_dir
+        training_state_dir = step_dir
+    ckpt_dir = step_dir
 
     # Clear memory before loading checkpoints
     if torch.cuda.is_available():
@@ -217,7 +233,7 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
     try:
         # Load model state with error handling
         logging.info("Loading model state...")
-        safetensors_path = ckpt_dir / "model.safetensors"
+        safetensors_path = pretrained_dir / "model.safetensors"
 
         if safetensors_path.exists():
             model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
@@ -232,7 +248,9 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
 
         # Load optimizer state with error handling
         logging.info("Loading optimizer state...")
-        optimizer_path = ckpt_dir / "optimizer.pt"
+        optimizer_path = training_state_dir / "optimizer.pt"
+        if not optimizer_path.exists():
+            optimizer_path = pretrained_dir / "optimizer.pt"
 
         if optimizer_path.exists():
             optimizer_state_dict = torch.load(optimizer_path, map_location=device, weights_only=False)
@@ -248,7 +266,10 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
 
         # Load metadata
         logging.info("Loading metadata...")
-        metadata = torch.load(ckpt_dir / "metadata.pt", map_location=device, weights_only=False)
+        metadata_path = training_state_dir / "metadata.pt"
+        if not metadata_path.exists():
+            metadata_path = pretrained_dir / "metadata.pt"
+        metadata = torch.load(metadata_path, map_location=device, weights_only=False)
         global_step = metadata.get("global_step", latest_step)
         del metadata
         torch.cuda.empty_cache()
@@ -273,12 +294,8 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
 
 def get_latest_checkpoint_step(checkpoint_dir):
     """Get the latest checkpoint step number from a checkpoint directory."""
-    checkpoint_steps = [
-        int(d.name)
-        for d in checkpoint_dir.iterdir()
-        if d.is_dir() and d.name.isdigit() and not d.name.startswith("tmp_")
-    ]
-    return max(checkpoint_steps) if checkpoint_steps else None
+    steps = _train_log.list_checkpoint_steps(checkpoint_dir)
+    return max(steps) if steps else None
 
 
 def log_memory_usage(device, step, phase="unknown"):
@@ -306,10 +323,136 @@ def log_memory_usage(device, step, phase="unknown"):
     )
 
 
+def load_pytorch_weight_path(model, weight_path: str, device: str | None = None) -> None:
+    """Load ``model.safetensors`` from a π0.5 weight dir.
+
+    ``pi05_fixed`` has a tied embed_tokens key under ``paligemma.model.language_model``
+    that current HF PaliGemma does not register; match eval and load non-strict.
+    """
+    raw = _unwrap_model(model)
+    model_path = os.path.join(weight_path, "model.safetensors")
+    try:
+        if device is not None:
+            missing, unexpected = safetensors.torch.load_model(raw, model_path, strict=False, device=device)
+        else:
+            missing, unexpected = safetensors.torch.load_model(raw, model_path, strict=False)
+        logging.info(
+            "Weight load (strict=False): missing=%s unexpected=%s",
+            len(missing or []),
+            len(unexpected or []),
+        )
+        if missing:
+            logging.warning("Missing weight keys (first 12): %s", list(missing)[:12])
+        if unexpected:
+            logging.info("Unexpected weight keys (first 8): %s", list(unexpected)[:8])
+        return
+    except TypeError:
+        safetensors.torch.load_model(raw, model_path, strict=False)
+        return
+    except Exception:
+        logging.warning("safetensors.load_model failed; remapping keys from %s", model_path, exc_info=True)
+
+    state = safetensors.torch.load_file(model_path)
+    model_state = raw.state_dict()
+    remapped = {}
+    skipped = 0
+    for key, tensor in state.items():
+        target = key
+        if target not in model_state:
+            alt = target.replace(".model.language_model.", ".language_model.")
+            if alt in model_state:
+                target = alt
+        if target in model_state and tuple(model_state[target].shape) == tuple(tensor.shape):
+            remapped[target] = tensor
+        else:
+            skipped += 1
+    missing, unexpected = raw.load_state_dict(remapped, strict=False)
+    logging.info(
+        "Remapped weight load: used=%s skipped=%s missing=%s unexpected=%s",
+        len(remapped),
+        skipped,
+        len(missing),
+        len(unexpected),
+    )
+
+
+def _unwrap_model(model):
+    return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+
+
+def param_is_trainable(name: str, mode: str) -> bool:
+    mode = (mode or "all").lower()
+    if mode == "all":
+        return True
+    n = name.replace("module.", "")
+    is_paligemma = "paligemma_with_expert.paligemma" in n
+    is_action = (
+        "gemma_expert" in n
+        or "action_in_proj" in n
+        or "action_out_proj" in n
+        or n.startswith("time_mlp")
+        or ".time_mlp" in n
+        or n.startswith("state_proj")
+        or ".state_proj" in n
+        or "action_time_mlp" in n
+    )
+    if mode == "paligemma":
+        return is_paligemma
+    if mode == "action":
+        return is_action
+    raise ValueError(f"unknown trainable_modules={mode!r}; expected all|paligemma|action")
+
+
+def apply_trainable_modules(model, mode: str) -> tuple[int, int]:
+    raw = _unwrap_model(model)
+    n_on = n_off = 0
+    for name, param in raw.named_parameters():
+        train = param_is_trainable(name, mode)
+        param.requires_grad = train
+        if train:
+            n_on += param.numel()
+        else:
+            n_off += param.numel()
+    return n_on, n_off
+
+
+def build_optimizer(model, config: _config.TrainConfig):
+    params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        raise RuntimeError(f"no trainable parameters for trainable_modules={config.trainable_modules}")
+    return torch.optim.AdamW(
+        params,
+        lr=config.lr_schedule.peak_lr,
+        betas=(config.optimizer.b1, config.optimizer.b2),
+        eps=config.optimizer.eps,
+        weight_decay=config.optimizer.weight_decay,
+    )
+
+
+def resolve_trainable_mode(config: _config.TrainConfig, global_step: int, steps_per_epoch: int | None) -> tuple[str, int | None]:
+    stage2_step = None
+    if config.stage2_trainable_modules is not None:
+        if config.stage2_start_step is not None:
+            stage2_step = int(config.stage2_start_step)
+        elif config.stage2_start_epoch is not None:
+            spe = int(steps_per_epoch or 0)
+            if spe < 1:
+                raise ValueError("stage2_start_epoch needs a resolved epoch schedule (num_epochs + dataset length)")
+            stage2_step = int(config.stage2_start_epoch) * spe
+        else:
+            raise ValueError("stage2_trainable_modules requires stage2_start_step or stage2_start_epoch")
+    if stage2_step is not None and global_step >= stage2_step:
+        return str(config.stage2_trainable_modules), stage2_step
+    return str(config.trainable_modules), stage2_step
+
+
 def train_loop(config: _config.TrainConfig):
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
+
+    config = _schedule.resolve_epoch_schedule(config)
+    steps_per_epoch = _schedule.steps_per_epoch_from_config(config)
 
     # Initialize checkpoint directory and wandb
     resuming = False
@@ -341,6 +484,31 @@ def train_loop(config: _config.TrainConfig):
     else:
         # For resume, checkpoint_dir is already set to the experiment directory
         logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
+
+    # Initialize local train.log / hardware artifacts (main process only)
+    resource_monitor = None
+    loss_steps: list[int] = []
+    loss_values: list[float] = []
+    if is_main:
+        _train_log.init_train_log(
+            config.checkpoint_dir,
+            config,
+            append=resuming,
+            hardware_extra={
+                "framework": "pytorch",
+                "world_size": int(torch.distributed.get_world_size() if use_ddp else 1),
+                "local_rank": local_rank,
+                "device": str(device),
+                "exp_name": config.exp_name,
+                "config_name": config.name,
+            },
+        )
+        try:
+            resource_monitor = _train_log.start_resource_monitor(config.checkpoint_dir)
+        except Exception:
+            logging.exception("Failed to start resource monitor")
+        if resuming:
+            loss_steps, loss_values = _train_log.load_train_loss_history(config.checkpoint_dir)
 
     # Initialize wandb (only on main process)
     if is_main:
@@ -441,10 +609,10 @@ def train_loop(config: _config.TrainConfig):
     # Load weights from weight_loader if specified (for fine-tuning)
     if config.pytorch_weight_path is not None:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
-
-        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
+        load_pytorch_weight_path(
+            model,
+            config.pytorch_weight_path,
+            device=str(device),
         )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
@@ -454,20 +622,34 @@ def train_loop(config: _config.TrainConfig):
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
 
-    # Create optimizer with config parameters
-    optim = torch.optim.AdamW(
-        model.parameters(),
-        lr=peak_lr,
-        betas=(config.optimizer.b1, config.optimizer.b2),
-        eps=config.optimizer.eps,
-        weight_decay=config.optimizer.weight_decay,
-    )
-
-    # Load checkpoint if resuming
     global_step = 0
     if resuming:
-        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
+        latest_step = get_latest_checkpoint_step(config.checkpoint_dir)
+        if latest_step is not None:
+            global_step = int(latest_step)
+
+    trainable_mode, stage2_step = resolve_trainable_mode(config, global_step, steps_per_epoch)
+    n_on, n_off = apply_trainable_modules(model, trainable_mode)
+    logging.info(
+        f"trainable_modules={trainable_mode} params_on={n_on} params_off={n_off} "
+        f"stage2={config.stage2_trainable_modules} stage2_step={stage2_step}"
+    )
+    optim = build_optimizer(model, config)
+    stage_switched = bool(
+        config.stage2_trainable_modules is not None and trainable_mode == str(config.stage2_trainable_modules)
+    )
+
+    if resuming:
+        global_step = load_checkpoint(
+            model, optim, config.checkpoint_dir, device, total_steps=config.num_train_steps
+        )
         logging.info(f"Resumed training from step {global_step}")
+        trainable_mode, stage2_step = resolve_trainable_mode(config, global_step, steps_per_epoch)
+        n_on, n_off = apply_trainable_modules(model, trainable_mode)
+        stage_switched = bool(
+            config.stage2_trainable_modules is not None and trainable_mode == str(config.stage2_trainable_modules)
+        )
+        logging.info(f"Post-resume freeze trainable_modules={trainable_mode} on={n_on} off={n_off}")
 
     def lr_schedule(step: int):
         if step < warmup_steps:
@@ -498,6 +680,10 @@ def train_loop(config: _config.TrainConfig):
         )
         logging.info("EMA is not supported for PyTorch training")
         logging.info(f"Training precision: {model_cfg.dtype}")
+        logging.info(
+            f"Freeze schedule: trainable={config.trainable_modules} "
+            f"stage2={config.stage2_trainable_modules} stage2_step={stage2_step}"
+        )
 
     # Training loop - iterate until we reach num_train_steps
     pbar = (
@@ -521,6 +707,23 @@ def train_loop(config: _config.TrainConfig):
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
 
+            if (
+                stage2_step is not None
+                and not stage_switched
+                and global_step >= stage2_step
+                and config.stage2_trainable_modules is not None
+            ):
+                if use_ddp and dist.is_initialized():
+                    dist.barrier()
+                n_on, n_off = apply_trainable_modules(model, config.stage2_trainable_modules)
+                optim = build_optimizer(model, config)
+                stage_switched = True
+                if is_main:
+                    logging.info(
+                        f"Stage2 switch at step={global_step}: trainable={config.stage2_trainable_modules} "
+                        f"params_on={n_on} params_off={n_off}"
+                    )
+
             # Update LR
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
@@ -543,7 +746,8 @@ def train_loop(config: _config.TrainConfig):
                 log_memory_usage(device, global_step, "after_backward")
 
             # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=config.optimizer.clip_gradient_norm)
 
             # Optimizer step
             optim.step()
@@ -565,7 +769,7 @@ def train_loop(config: _config.TrainConfig):
                     }
                 )
 
-            if is_main and (global_step % config.log_interval == 0):
+            if is_main and (global_step % config.log_interval == 0) and infos:
                 elapsed = time.time() - start_time
 
                 # Average stats over log interval
@@ -580,13 +784,31 @@ def train_loop(config: _config.TrainConfig):
                     if len(vals) > 0:
                         avg_grad_norm = sum(vals) / len(vals)
                 logging.info(
+                    _train_log.format_metrics_line(
+                        global_step,
+                        loss=avg_loss,
+                        grad_norm=avg_grad_norm,
+                        lr=avg_lr,
+                        update_s=elapsed / max(1, config.log_interval),
+                        epoch=(global_step / steps_per_epoch) if steps_per_epoch else None,
+                    )
+                )
+                # Keep a human-readable summary as well.
+                logging.info(
                     f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
                     if avg_grad_norm is not None
                     else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
                 )
 
+                while loss_steps and loss_steps[-1] >= int(global_step):
+                    loss_steps.pop()
+                    loss_values.pop()
+                loss_steps.append(int(global_step))
+                loss_values.append(float(avg_loss))
+                _train_log.save_train_loss_plot(config.checkpoint_dir, loss_steps, loss_values)
+
                 # Log to wandb
-                if config.wandb_enabled and len(infos) > 0:
+                if config.wandb_enabled:
                     log_payload = {
                         "loss": avg_loss,
                         "learning_rate": avg_lr,
@@ -614,6 +836,16 @@ def train_loop(config: _config.TrainConfig):
     # Close progress bar
     if pbar is not None:
         pbar.close()
+
+    if is_main:
+        if loss_steps:
+            _train_log.save_train_loss_plot(config.checkpoint_dir, loss_steps, loss_values)
+        if resource_monitor is not None:
+            try:
+                resource_monitor.stop()
+            except Exception:
+                logging.exception("Failed to stop resource monitor")
+        logging.info("End of training")
 
     # Finish wandb run
     if is_main and config.wandb_enabled:

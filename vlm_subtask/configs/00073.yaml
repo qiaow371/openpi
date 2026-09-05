@@ -1,0 +1,11 @@
+dataset_id: "00073"
+task: >-
+  Using both hands, pick up the courier items from the green conveyor belt.
+  Place the white courier bags into the left box and the brown courier boxes
+  into the right box.
+subtask_templates:
+  approach: reach toward the conveyor belt
+  pick_from_belt: pick up the courier item from the belt
+  place_left: place the white bag into the left box
+  place_right: place the brown box into the right box
+  transit: move the {hand} arm into position

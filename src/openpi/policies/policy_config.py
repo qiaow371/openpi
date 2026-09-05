@@ -10,6 +10,7 @@ import openpi.policies.policy as _policy
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
+from openpi.training import train_log as _train_log
 import openpi.transforms as transforms
 
 
@@ -44,12 +45,14 @@ def create_trained_policy(
     """
     repack_transforms = repack_transforms or transforms.Group()
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
+    # Resolve ACT-aligned layout: checkpoints/{step}/pretrained_model/ (also accepts legacy flat dirs).
+    checkpoint_dir = pathlib.Path(_train_log.resolve_pretrained_model_dir(checkpoint_dir))
 
     # Check if this is a PyTorch model by looking for model.safetensors
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")
     is_pytorch = os.path.exists(weight_path)
 
-    logging.info("Loading model...")
+    logging.info("Loading model from %s...", checkpoint_dir)
     if is_pytorch:
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
@@ -57,11 +60,21 @@ def create_trained_policy(
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
-        # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
-        # that the policy is using the same normalization stats as the original training process.
-        if data_config.asset_id is None:
-            raise ValueError("Asset id is required to load norm stats.")
-        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+        assets_candidates = [
+            checkpoint_dir.parent / "assets",
+            checkpoint_dir / "assets",
+        ]
+        last_error: Exception | None = None
+        for assets_dir in assets_candidates:
+            try:
+                norm_stats = _checkpoints.load_norm_stats(assets_dir, data_config.asset_id)
+                break
+            except FileNotFoundError as exc:
+                last_error = exc
+        else:
+            if last_error is not None:
+                raise last_error
+            raise FileNotFoundError(f"Norm stats not found next to {checkpoint_dir}")
 
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:
@@ -83,7 +96,7 @@ def create_trained_policy(
         ],
         output_transforms=[
             *data_config.model_transforms.outputs,
-            transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm, strict=False),
             *data_config.data_transforms.outputs,
             *repack_transforms.outputs,
         ],

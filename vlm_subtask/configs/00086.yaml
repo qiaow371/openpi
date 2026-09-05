@@ -1,0 +1,12 @@
+dataset_id: "00086"
+task: >-
+  Using both hands, pull open the drawer with the blue handle using your left
+  hand, take out the white medicine box with your right hand, place it into
+  the green drawer, and finally close the drawer.
+subtask_templates:
+  approach: reach for the blue-handle drawer
+  open_drawer: open the drawer with the blue handle
+  grasp_box: pick up the white medicine box
+  place_in_green: place the medicine box into the green drawer
+  close_drawer: close the blue-handle drawer
+  transit: move the {hand} arm into position

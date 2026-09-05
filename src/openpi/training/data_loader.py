@@ -2,12 +2,16 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+try:
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+except ModuleNotFoundError:
+    import lerobot.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -127,6 +131,59 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def inspect_subtask_sidecar(repo_id: str | None) -> dict:
+    """Coverage of AgiBot-style ``action_config`` sidecar next to a LeRobot repo."""
+    out: dict = {
+        "sidecar": None,
+        "annotated_episodes": 0,
+        "total_episodes": None,
+        "spans": 0,
+    }
+    if not repo_id or repo_id == "fake":
+        return out
+    root = pathlib.Path(repo_id)
+    meta = root / "meta"
+    if not meta.is_dir():
+        return out
+    info = meta / "info.json"
+    if info.is_file():
+        import json
+
+        try:
+            out["total_episodes"] = json.loads(info.read_text()).get("total_episodes")
+        except Exception:
+            pass
+    sidecar = None
+    for name in ("episodes_detailed_task.jsonl", "subtask_spans.jsonl"):
+        cand = meta / name
+        if cand.is_file():
+            sidecar = cand
+            break
+    if sidecar is None:
+        return out
+    out["sidecar"] = str(sidecar)
+    import json
+
+    eps: set[int] = set()
+    n_spans = 0
+    with sidecar.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if "action_config" in obj:
+                ep = int(obj.get("episode_index", obj.get("episode_id", 0)))
+                eps.add(ep)
+                n_spans += len(obj["action_config"])
+            else:
+                eps.add(int(obj["episode_index"]))
+                n_spans += 1
+    out["annotated_episodes"] = len(eps)
+    out["spans"] = n_spans
+    return out
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -148,6 +205,29 @@ def create_torch_dataset(
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
+    if getattr(data_config, "prompt_from_subtask", False):
+        root = pathlib.Path(dataset_meta.root) / "meta"
+        spans_file = None
+        for name in ("episodes_detailed_task.jsonl", "subtask_spans.jsonl"):
+            cand = root / name
+            if cand.is_file():
+                spans_file = cand
+                break
+        if spans_file is not None:
+            cov = inspect_subtask_sidecar(str(dataset_meta.root))
+            logging.info(
+                "Loading AgiBot-style subtask prompts from %s (%s/%s episodes, %s spans)",
+                spans_file,
+                cov["annotated_episodes"],
+                cov["total_episodes"],
+                cov["spans"],
+            )
+            dataset = TransformedDataset(dataset, [_transforms.PromptFromSubtaskSpans.from_jsonl(spans_file)])
+        else:
+            logging.warning(
+                "data.prompt_from_subtask=true but meta/episodes_detailed_task.jsonl missing; using global task only"
+            )
+
     return dataset
 
 
@@ -165,7 +245,7 @@ def create_rlds_dataset(
         shuffle=shuffle,
         action_chunk_size=action_horizon,
         action_space=data_config.action_space,
-        datasets=data_config.datasets,
+        filter_dict_path=data_config.filter_dict_path,
     )
 
 
@@ -220,6 +300,30 @@ def transform_iterable_dataset(
     )
 
 
+class FilterByEpisode:
+    """Keep only samples whose episode_index is in ``allow`` (used for offline val)."""
+
+    def __init__(self, dataset, allow: set[int]):
+        self._dataset = dataset
+        self._idxs: list[int] = []
+        for i in range(len(dataset)):
+            sample = dataset[i]
+            ep = sample.get("episode_index", sample.get("episode"))
+            if ep is None:
+                continue
+            ep_i = int(ep.item()) if hasattr(ep, "item") else int(ep)
+            if ep_i in allow:
+                self._idxs.append(i)
+        if not self._idxs:
+            raise ValueError(f"FilterByEpisode: 0 frames in allowlist size={len(allow)}")
+
+    def __getitem__(self, index):
+        return self._dataset[self._idxs[index]]
+
+    def __len__(self) -> int:
+        return len(self._idxs)
+
+
 def create_data_loader(
     config: _config.TrainConfig,
     *,
@@ -228,6 +332,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
+    episode_allowlist: set[int] | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -265,6 +370,7 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
+        episode_allowlist=episode_allowlist,
     )
 
 
@@ -281,6 +387,7 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
+    episode_allowlist: set[int] | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -300,6 +407,9 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    if episode_allowlist is not None:
+        dataset = FilterByEpisode(dataset, episode_allowlist)
+        logging.info("FilterByEpisode keep %s frames from %s episodes", len(dataset), len(episode_allowlist))
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks

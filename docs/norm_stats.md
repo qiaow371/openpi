@@ -2,6 +2,26 @@
 
 Following common practice, our models normalize the proprioceptive state inputs and action targets during policy training and inference. The statistics used for normalization are computed over the training data and stored alongside the model checkpoint.
 
+## Local datasets (recommended)
+
+1. Precompute stats onto the **dataset root** (writes `{repo_id}/norm_stats.json`):
+
+```bash
+uv run scripts/compute_norm_stats.py --config-name pi05_aloha --dataset-dir /path/to/lerobot_dataset
+```
+
+2. Point training at that file via YAML / `AssetsConfig` (usually `assets_dir` = `repo_id`, `asset_id: "."`):
+
+```yaml
+data:
+  repo_id: /path/to/lerobot_dataset
+  assets:
+    assets_dir: /path/to/lerobot_dataset
+    asset_id: "."
+```
+
+Training **loads** these stats and copies them into the checkpoint `assets/` for inference. It does **not** recompute them, and does **not** write under top-level `./assets` unless you leave `data.assets.assets_dir` unset (fallback only).
+
 ## Reloading normalization statistics
 
 When you fine-tune one of our models on a new dataset, you need to decide whether to (A) reuse existing normalization statistics or (B) compute new statistics over your new training data. Which option is better for you depends on the similarity of your robot and task to the robot and task distribution in the pre-training dataset. Below, we list all the available pre-training normalization statistics for each model.

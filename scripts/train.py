@@ -23,7 +23,9 @@ import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.optimizer as _optimizer
+import openpi.training.schedule as _schedule
 import openpi.training.sharding as sharding
+import openpi.training.train_log as _train_log
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
@@ -44,7 +46,12 @@ def init_logging():
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    logger.handlers[0].setFormatter(formatter)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    else:
+        logger.handlers[0].setFormatter(formatter)
 
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
@@ -195,6 +202,9 @@ def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
+    config = _schedule.resolve_epoch_schedule(config)
+    steps_per_epoch = _schedule.steps_per_epoch_from_config(config)
+
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
@@ -215,6 +225,24 @@ def main(config: _config.TrainConfig):
         overwrite=config.overwrite,
         resume=config.resume,
     )
+    _train_log.init_train_log(
+        config.checkpoint_dir,
+        config,
+        append=resuming,
+        hardware_extra={
+            "framework": "jax",
+            "device_count": int(jax.device_count()),
+            "fsdp_devices": config.fsdp_devices,
+            "exp_name": config.exp_name,
+            "config_name": config.name,
+        },
+    )
+    resource_monitor = None
+    if jax.process_index() == 0:
+        try:
+            resource_monitor = _train_log.start_resource_monitor(config.checkpoint_dir)
+        except Exception:
+            logging.exception("Failed to start resource monitor")
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
     data_loader = _data_loader.create_data_loader(
@@ -256,24 +284,92 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
+    loss_steps: list[int] = []
+    loss_values: list[float] = []
+    if resuming and jax.process_index() == 0:
+        loss_steps, loss_values = _train_log.load_train_loss_history(config.checkpoint_dir)
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
-        if step % config.log_interval == 0:
+        if step % config.log_interval == 0 and infos:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
+            logging.info(
+                _train_log.format_metrics_line(
+                    step,
+                    loss=reduced_info.get("loss"),
+                    grad_norm=reduced_info.get("grad_norm"),
+                    epoch=(step / steps_per_epoch) if steps_per_epoch else None,
+                    extra={
+                        k: v
+                        for k, v in reduced_info.items()
+                        if k not in {"loss", "grad_norm"}
+                    },
+                )
+            )
             wandb.log(reduced_info, step=step)
+            if jax.process_index() == 0:
+                try:
+                    loss_f = float(reduced_info.get("loss"))
+                except (TypeError, ValueError):
+                    loss_f = None
+                if loss_f is not None:
+                    # Drop overlapping resume steps so the curve stays monotonic.
+                    while loss_steps and loss_steps[-1] >= int(step):
+                        loss_steps.pop()
+                        loss_values.pop()
+                    loss_steps.append(int(step))
+                    loss_values.append(loss_f)
+                    _train_log.save_train_loss_plot(config.checkpoint_dir, loss_steps, loss_values)
             infos = []
         batch = next(data_iter)
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+        is_last = step == config.num_train_steps - 1
+        should_save = (step % config.save_interval == 0 and step > start_step) or is_last
+        if config.save_full_interval is not None:
+            should_save = should_save or (
+                step % config.save_full_interval == 0 and step > start_step
+            )
+        if should_save:
+            include_train_state = (
+                config.save_full_interval is None
+                or is_last
+                or (step % config.save_full_interval == 0)
+            )
+            kind = "full" if include_train_state else "params-only"
+            logging.info("Checkpoint %s after step %s", kind, step)
+            _checkpoints.save_state(
+                checkpoint_manager,
+                train_state,
+                data_loader,
+                step,
+                include_train_state=include_train_state,
+            )
+            checkpoint_manager.wait_until_finished()
+            if jax.process_index() == 0:
+                try:
+                    _checkpoints.finalize_step_checkpoint(
+                        config.checkpoint_dir,
+                        step,
+                        total_steps=config.num_train_steps,
+                        config=config,
+                    )
+                except Exception:
+                    logging.exception("Failed to finalize checkpoint layout after step %s", step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
+    if jax.process_index() == 0 and loss_steps:
+        _train_log.save_train_loss_plot(config.checkpoint_dir, loss_steps, loss_values)
+    if resource_monitor is not None:
+        try:
+            resource_monitor.stop()
+        except Exception:
+            logging.exception("Failed to stop resource monitor")
+    logging.info("End of training")
 
 
 if __name__ == "__main__":

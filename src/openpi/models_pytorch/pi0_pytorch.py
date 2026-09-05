@@ -75,7 +75,8 @@ def make_att_2d_masks(pad_masks, att_masks):
     if pad_masks.ndim != 2:
         raise ValueError(pad_masks.ndim)
 
-    cumsum = torch.cumsum(att_masks, dim=1)
+    att_masks_int = att_masks.to(torch.int32)
+    cumsum = torch.cumsum(att_masks_int, dim=1)
     att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
     pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
     return att_2d_masks & pad_2d_masks
@@ -97,20 +98,19 @@ class PI0Pytorch(nn.Module):
             precision=config.dtype,
         )
 
-        self.action_in_proj = nn.Linear(config.action_dim, action_expert_config.width)
-        self.action_out_proj = nn.Linear(action_expert_config.width, config.action_dim)
+        self.action_in_proj = nn.Linear(32, action_expert_config.width)
+        self.action_out_proj = nn.Linear(action_expert_config.width, 32)
 
         if self.pi05:
             self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
             self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
         else:
-            self.state_proj = nn.Linear(config.action_dim, action_expert_config.width)
+            self.state_proj = nn.Linear(32, action_expert_config.width)
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
-        if config.pytorch_compile_mode is not None:
-            self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
+        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
