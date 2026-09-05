@@ -1,17 +1,18 @@
+import dataclasses
 import json
+import logging
 import pathlib
 
+import flax.traverse_util
 import numpy as np
-import numpydantic
-import pydantic
 
 
-@pydantic.dataclasses.dataclass
+@dataclasses.dataclass
 class NormStats:
-    mean: numpydantic.NDArray
-    std: numpydantic.NDArray
-    q01: numpydantic.NDArray | None = None  # 1st quantile
-    q99: numpydantic.NDArray | None = None  # 99th quantile
+    mean: np.ndarray
+    std: np.ndarray
+    q01: np.ndarray | None = None  # 1st quantile
+    q99: np.ndarray | None = None  # 99th quantile
 
 
 class RunningStats:
@@ -117,18 +118,27 @@ class RunningStats:
         return results
 
 
-class _NormStatsDict(pydantic.BaseModel):
-    norm_stats: dict[str, NormStats]
-
-
 def serialize_json(norm_stats: dict[str, NormStats]) -> str:
     """Serialize the running statistics to a JSON string."""
-    return _NormStatsDict(norm_stats=norm_stats).model_dump_json(indent=2)
+    data = {
+        "norm_stats": {
+            key: {
+                field.name: value.tolist() if isinstance(value, np.ndarray) else value
+                for field in dataclasses.fields(stats)
+                if (value := getattr(stats, field.name)) is not None
+            }
+            for key, stats in norm_stats.items()
+        }
+    }
+    return json.dumps(data, indent=2)
 
 
 def deserialize_json(data: str) -> dict[str, NormStats]:
     """Deserialize the running statistics from a JSON string."""
-    return _NormStatsDict(**json.loads(data)).norm_stats
+    return {
+        key: NormStats(**{field: np.asarray(value) for field, value in stats.items()})
+        for key, stats in json.loads(data)["norm_stats"].items()
+    }
 
 
 def save(directory: pathlib.Path | str, norm_stats: dict[str, NormStats]) -> None:
@@ -138,9 +148,73 @@ def save(directory: pathlib.Path | str, norm_stats: dict[str, NormStats]) -> Non
     path.write_text(serialize_json(norm_stats))
 
 
+def _convert_lerobot_stats(lerobot_stats: dict) -> dict[str, NormStats]:
+    """Convert lerobot stats.json format to openpi NormStats format.
+    
+    Lerobot format: {"key": {"mean": [...], "std": [...], "min": [...], "max": [...]}}
+    Openpi format: {"key": NormStats(mean=..., std=..., q01=..., q99=...)}
+    """
+    result = {}
+    flat_stats = flax.traverse_util.flatten_dict(lerobot_stats, sep="/")
+    
+    for key, stats_dict in flat_stats.items():
+        if not isinstance(stats_dict, dict):
+            continue
+        
+        # Extract mean and std
+        mean = np.array(stats_dict.get("mean", []))
+        std = np.array(stats_dict.get("std", []))
+        
+        # For quantiles, use min/max if available, otherwise set to None
+        q01 = None
+        q99 = None
+        if "min" in stats_dict and "max" in stats_dict:
+            # Use min/max as approximate quantiles
+            q01 = np.array(stats_dict["min"])
+            q99 = np.array(stats_dict["max"])
+        elif "q01" in stats_dict and "q99" in stats_dict:
+            q01 = np.array(stats_dict["q01"])
+            q99 = np.array(stats_dict["q99"])
+        
+        # Ensure arrays are at least 1D
+        if mean.ndim == 0:
+            mean = mean[None]
+        if std.ndim == 0:
+            std = std[None]
+        if q01 is not None and q01.ndim == 0:
+            q01 = q01[None]
+        if q99 is not None and q99.ndim == 0:
+            q99 = q99[None]
+        
+        result[key] = NormStats(mean=mean, std=std, q01=q01, q99=q99)
+    
+    return result
+
+
 def load(directory: pathlib.Path | str) -> dict[str, NormStats]:
-    """Load the normalization stats from a directory."""
-    path = pathlib.Path(directory) / "norm_stats.json"
-    if not path.exists():
-        raise FileNotFoundError(f"Norm stats file not found at: {path}")
-    return deserialize_json(path.read_text())
+    """Load the normalization stats from a directory.
+    
+    Tries to load in the following order:
+    1. norm_stats.json (openpi format)
+    2. meta/stats.json (lerobot format, will be converted)
+    """
+    directory = pathlib.Path(directory)
+    
+    # Try openpi format first
+    norm_stats_path = directory / "norm_stats.json"
+    if norm_stats_path.exists():
+        return deserialize_json(norm_stats_path.read_text())
+    
+    # Try lerobot format
+    lerobot_stats_path = directory / "meta" / "stats.json"
+    if lerobot_stats_path.exists():
+        lerobot_stats = json.loads(lerobot_stats_path.read_text())
+        converted_stats = _convert_lerobot_stats(lerobot_stats)
+        logging.info(f"Loaded and converted lerobot stats from {lerobot_stats_path}")
+        return converted_stats
+    
+    raise FileNotFoundError(
+        f"Norm stats file not found. Tried:\n"
+        f"  - {norm_stats_path}\n"
+        f"  - {lerobot_stats_path}"
+    )

@@ -1,5 +1,6 @@
 import logging
 import os
+import pathlib
 
 import jax
 import numpy as np
@@ -11,11 +12,21 @@ import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
 
 
+def _paligemma_tokenizer_path() -> pathlib.Path:
+    local_path = os.getenv("PALIGEMMA_TOKENIZER_PATH")
+    if local_path:
+        path = pathlib.Path(local_path).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"PaliGemma tokenizer not found: {path}")
+        return path
+    return download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+
+
 class PaligemmaTokenizer:
     def __init__(self, max_len: int = 48):
         self._max_len = max_len
 
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        path = _paligemma_tokenizer_path()
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
@@ -53,7 +64,7 @@ class FASTTokenizer:
         self._max_len = max_len
 
         # Download base PaliGemma tokenizer
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        path = _paligemma_tokenizer_path()
         with path.open("rb") as f:
             self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
