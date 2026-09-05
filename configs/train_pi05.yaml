@@ -1,0 +1,84 @@
+# openpi π0.5 训练配置（字段名对齐 TrainConfig / lr_schedule / optimizer）
+#
+# 用法:
+#   +
+#   python scripts/train_from_yaml.py --config configs/train_pi05.yaml --dry-run
+#
+# 本分支仅支持 PyTorch（framework 必须为 pytorch）。
+#
+# config_name 对应 src/openpi/training/config.py 里已注册的 TrainConfig.name
+# 下面字段会覆盖该预设；未写的字段保留预设默认值。
+#
+# 训练量（二选一）:
+#   - num_epochs: 标准 epoch，1 epoch = 扫完数据集一遍
+#       num_train_steps = num_epochs * (len(dataset) // batch_size)
+#   - num_train_steps: 纯 step 模式（不设 num_epochs 时使用）
+# 有 num_epochs 时优先，会覆盖预设里的 num_train_steps，并把
+# lr_schedule.decay_steps 设为 resolved num_train_steps。
+
+config_name: pi05_aloha
+framework: pytorch
+
+# 省略或 auto 时自动生成：
+#   {policy}_chunk_{N}_lr_{lr}_epochs_{E}[_{abbr}_{val}...]_{YYYYMMDD}
+# 其中 _{abbr}_{val} 仅在数字超参相对本分支 train_pi05.yaml 默认有变化时追加（如 bs_8）；字符串/bool 不参与
+# resume 时填已有 run 名（不要用 auto）
+# exp_name: auto
+exp_name: 00092_PI05_bs32_chunk50_wd6.0e-6_dq
+project_name: openpi
+checkpoint_base_dir: /nvme2n1/outputs
+# 仅作默认回退；江算流程用 data.assets.assets_dir 指向数据集里预生成的 norm_stats.json。
+# 训练过程会把已加载的 norm_stats 拷进 checkpoint 的 assets/，供推理使用。
+assets_base_dir: ./assets
+
+batch_size: 32
+# 标准 epoch 训练（优先于 num_train_steps）
+num_epochs: 100
+# num_train_steps: 30000  # 有 num_epochs 时由代码推算，无需填写
+seed: 42
+num_workers: 0
+log_interval: 100
+# 每 N 个 epoch 存一次；会换算为 save_interval = N * steps_per_epoch
+save_every_epochs: 1
+# save_interval: 1000  # 纯 step 模式再用；有 save_every_epochs 时由代码推算
+keep_period: 5000
+overwrite: false
+resume: false
+wandb_enabled: false
+fsdp_devices: 1
+ema_decay: 0.99
+
+# PyTorch 训练时可用
+pytorch_training_precision: bfloat16
+pytorch_weight_path: /home/ubuntu/lerobot/CQTongBot-train-ppu/base_model/pi05_fixed
+
+# 模型：action_horizon 等价于 ACT 的 chunk_size（一次预测的动作步数）
+model:
+  action_horizon: 50
+
+# 学习率（CosineDecaySchedule）
+# decay_steps 在 num_epochs 模式下自动设为 resolved num_train_steps
+lr_schedule:
+  warmup_steps: 1000
+  peak_lr: 2.5e-5
+  decay_lr: 2.5e-6
+
+# 优化器（AdamW）
+optimizer:
+  b1: 0.9
+  b2: 0.95
+  eps: 1.0e-8
+  weight_decay: 6.0e-6
+  clip_gradient_norm: 1.0
+
+# 数据集与预计算 norm_stats（先跑 compute_norm_stats_v21.py 写到数据集根目录）
+data:
+  repo_id: /nvme2n1/dataset/00092_20260904_RM_01_DQ_21
+  assets:
+    # 指向含有 norm_stats.json 的目录（通常与 repo_id 相同）
+    assets_dir: /nvme2n1/dataset/00092_20260904_RM_01_DQ_21
+    asset_id: "."
+  default_prompt: "With both hands cooperating, put the white medicine box into the green drawer with the blue handle, put the yellow medicine box into the blue drawer with the black handle, and then close the drawers."
+  adapt_to_pi: false
+  delta_action_dims: [7, 7, -1, -1]
+  # delta_action_dims: [7, 7]

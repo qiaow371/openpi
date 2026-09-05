@@ -7,7 +7,10 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+try:
+    import lerobot.datasets.lerobot_dataset as lerobot_dataset
+except ModuleNotFoundError:
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -17,6 +20,29 @@ from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
+
+
+def _install_lerobot_v21_column_compat() -> None:
+    """Allow the v2.1 LeRobot loader to run with newer HuggingFace datasets.
+
+    Newer datasets versions return a lazy Column object for ``dataset[key]``;
+    the v2.1 loader expects the older list-like return value and passes it to
+    ``torch.stack``. Convert only that Column type, leaving all normal PyTorch
+    calls unchanged.
+    """
+    if getattr(torch.stack, "_openpi_lerobot_v21_compat", False):
+        return
+
+    original_stack = torch.stack
+
+    def stack_compat(tensors, *args, **kwargs):
+        tensors_type = type(tensors)
+        if tensors_type.__name__ == "Column" and tensors_type.__module__.startswith("datasets."):
+            tensors = list(tensors)
+        return original_stack(tensors, *args, **kwargs)
+
+    stack_compat._openpi_lerobot_v21_compat = True
+    torch.stack = stack_compat
 
 
 class Dataset(Protocol[T_co]):
@@ -137,12 +163,14 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
+    _install_lerobot_v21_column_compat()
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        video_backend=os.environ.get("LEROBOT_VIDEO_BACKEND", "pyav"),
     )
 
     if data_config.prompt_from_task:
@@ -165,7 +193,7 @@ def create_rlds_dataset(
         shuffle=shuffle,
         action_chunk_size=action_horizon,
         action_space=data_config.action_space,
-        datasets=data_config.datasets,
+        filter_dict_path=data_config.filter_dict_path,
     )
 
 
@@ -481,6 +509,8 @@ def _worker_init_fn(worker_id: int) -> None:
     # means that this approach will not work for selecting the backend.
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+    # spawn workers do not inherit the main-process torch.stack monkeypatch.
+    _install_lerobot_v21_column_compat()
 
 
 class RLDSDataLoader:
