@@ -1,0 +1,47 @@
+# 00061 cobot_magic / LeRobot v2.1 / 江算 PPU PyTorch π0.5
+config_name: pi05_aloha
+framework: pytorch
+
+exp_name: 00055_cigaiPI05_bs512_chunk50_red_black_orange_blue_filtered65_20260814
+project_name: openpi
+checkpoint_base_dir: /nvme2n1/outputs/pi05_aloha
+assets_base_dir: ./assets
+
+batch_size: 512
+num_epochs: 100
+seed: 42
+num_workers: 4
+log_interval: 100
+save_every_epochs: null
+save_interval: 500
+keep_period: 5000
+overwrite: false
+resume: false
+wandb_enabled: false
+fsdp_devices: 1
+ema_decay: 0.99
+
+pytorch_training_precision: bfloat16
+pytorch_weight_path: /home/ubuntu/lerobot/CQTongBot-train-ppu/base_model/pi05_fixed
+
+model:
+  action_horizon: 50
+
+lr_schedule:
+  warmup_steps: 1000
+  peak_lr: 2.5e-5
+  decay_lr: 2.5e-6
+
+optimizer:
+  b1: 0.9
+  b2: 0.95
+  eps: 1.0e-8
+  weight_decay: 1.0e-10
+  clip_gradient_norm: 1.0
+
+data:
+  repo_id: /nvme2n1/dataset/00055_20260810_agx02_dq_lerobot_v2.1
+  assets:
+    assets_dir: /nvme2n1/dataset/00055_20260810_agx02_dq_lerobot_v2.1
+    asset_id: "."
+  default_prompt: "Left arm: put the red sphere into the black box. Right arm: put the orange sphere into the blue box."

@@ -4,6 +4,8 @@ import asyncio
 import concurrent.futures as futures
 import dataclasses
 import logging
+import os
+from pathlib import Path
 from typing import Protocol
 
 from etils import epath
@@ -14,40 +16,58 @@ import orbax.checkpoint.future as future
 from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
 import openpi.training.data_loader as _data_loader
+import openpi.training.train_log as _train_log
 import openpi.training.utils as training_utils
 
 
 def initialize_checkpoint_dir(
-    checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
+    run_dir: epath.Path | str,
+    *,
+    keep_period: int | None,
+    overwrite: bool,
+    resume: bool,
+    max_to_keep: int = 10,
+    should_keep_fn=None,
 ) -> tuple[ocp.CheckpointManager, bool]:
-    checkpoint_dir = epath.Path(checkpoint_dir).resolve()
+    """Initialize Orbax manager under ``{run_dir}/checkpoints`` (ACT-aligned layout)."""
+    run_dir = epath.Path(run_dir).resolve()
+    checkpoints_dir = run_dir / _train_log.CHECKPOINTS_DIR
     resuming = False
-    if checkpoint_dir.exists():
+    if run_dir.exists():
         if overwrite:
-            checkpoint_dir.rmtree()
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            logging.info(f"Wiped checkpoint directory {checkpoint_dir}")
+            run_dir.rmtree()
+            run_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Wiped checkpoint directory {run_dir}")
         elif resume:
             resuming = True
         else:
             raise FileExistsError(
-                f"Checkpoint directory {checkpoint_dir} already exists. Use --overwrite or --resume "
+                f"Checkpoint directory {run_dir} already exists. Use --overwrite or --resume "
                 "to indicate how to handle it."
             )
 
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     mngr = ocp.CheckpointManager(
-        checkpoint_dir,
+        checkpoints_dir,
         item_handlers={
             "assets": CallbackHandler(),
             "train_state": ocp.PyTreeCheckpointHandler(),
             "params": ocp.PyTreeCheckpointHandler(),
         },
         options=ocp.CheckpointManagerOptions(
-            max_to_keep=1,
-            keep_period=keep_period,
+            max_to_keep=max(1, int(max_to_keep)),
+            keep_period=None if should_keep_fn is not None else keep_period,
+            should_keep_fn=should_keep_fn,
             create=False,
+            # Wait until the new step is fully on disk before deleting older
+            # ones. Async + max_to_keep=1 was deleting step N while N+1 was
+            # still in a tmp dir; an OOM then left zero usable checkpoints.
+            enable_async_checkpointing=False,
+            enable_background_delete=False,
+            cleanup_tmp_directories=True,
+            todelete_subdir=".orbax_deleted",
             async_options=ocp.AsyncOptions(timeout_secs=7200),
         ),
     )
@@ -69,11 +89,12 @@ def save_state(
     step: int,
 ):
     def save_assets(directory: epath.Path):
-        # Save the normalization stats.
         data_config = data_loader.data_config()
         norm_stats = data_config.norm_stats
-        if norm_stats is not None and data_config.asset_id is not None:
-            _normalize.save(directory / data_config.asset_id, norm_stats)
+        if norm_stats is not None:
+            out_dir = Path(directory)
+            _normalize.save(out_dir, norm_stats)
+            logging.info("Saved norm stats to %s", out_dir / "norm_stats.json")
 
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():
@@ -84,6 +105,71 @@ def save_state(
         "params": {"params": params},
     }
     checkpoint_manager.save(step, items)
+
+
+def finalize_step_checkpoint(
+    run_dir: epath.Path | str,
+    step: int,
+    *,
+    total_steps: int,
+    config: object | None = None,
+) -> epath.Path:
+    """
+    After Orbax finishes writing ``checkpoints/{step}/{params,assets,train_state}``,
+    add ACT-style ``pretrained_model/`` views + ``last`` / padded aliases.
+
+    Layout:
+      checkpoints/{step}/
+        params/, assets/, train_state/          # Orbax (resume)
+        pretrained_model/
+          params -> ../params
+          assets -> ../assets
+          config.json
+          train_config.json
+      checkpoints/{padded} -> {step}            # when padded != str(step)
+      checkpoints/last -> {padded or step}
+    """
+    run_dir = epath.Path(run_dir)
+    checkpoints_dir = run_dir / _train_log.CHECKPOINTS_DIR
+    step_dir = checkpoints_dir / str(int(step))
+    if not step_dir.exists():
+        raise FileNotFoundError(f"Expected Orbax step directory missing: {step_dir}")
+
+    pretrained = step_dir / _train_log.PRETRAINED_MODEL_DIR
+    pretrained.mkdir(parents=True, exist_ok=True)
+
+    for name in ("params", "assets"):
+        src = step_dir / name
+        dst = pretrained / name
+        if not src.exists():
+            continue
+        if dst.is_symlink() or dst.is_file():
+            dst.unlink()
+        elif dst.exists():
+            continue
+        # Relative symlink so the bundle stays portable within the run dir.
+        os.symlink(os.path.relpath(src, pretrained), dst)
+
+    if config is not None:
+        try:
+            _train_log.save_policy_config(pretrained, config)
+            _train_log.save_train_config(pretrained, config)
+        except Exception:
+            logging.exception("Failed to write config files into %s", pretrained)
+
+    padded = _train_log.get_step_identifier(step, total_steps)
+    public_step_dir = Path(step_dir)
+    if padded != str(int(step)):
+        alias = Path(checkpoints_dir) / padded
+        if alias.is_symlink() or alias.is_file():
+            alias.unlink()
+        if not alias.exists():
+            os.symlink(str(int(step)), alias)
+        public_step_dir = alias
+
+    _train_log.update_checkpoint_link(public_step_dir, _train_log.LAST_CHECKPOINT_LINK)
+    logging.info("Finalized checkpoint layout: %s", pretrained)
+    return pretrained
 
 
 def restore_state(
@@ -107,11 +193,25 @@ def restore_state(
     return _merge_params(restored["train_state"], restored["params"])
 
 
-def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _normalize.NormStats] | None:
-    norm_stats_dir = epath.Path(assets_dir) / asset_id
-    norm_stats = _normalize.load(norm_stats_dir)
-    logging.info(f"Loaded norm stats from {norm_stats_dir}")
-    return norm_stats
+def load_norm_stats(assets_dir: epath.Path | str, asset_id: str | None = None) -> dict[str, _normalize.NormStats] | None:
+    """Load norm stats from checkpoint ``assets/`` (flat) or legacy ``assets/{asset_id}/``."""
+    assets_dir = Path(assets_dir)
+    candidates = [assets_dir]
+    if asset_id:
+        rel = _train_log.asset_checkpoint_relpath(asset_id)
+        if rel:
+            candidates.extend([assets_dir / rel, assets_dir / Path(asset_id).name])
+    last_error: Exception | None = None
+    for norm_stats_dir in candidates:
+        try:
+            norm_stats = _normalize.load(norm_stats_dir)
+            logging.info("Loaded norm stats from %s", norm_stats_dir)
+            return norm_stats
+        except FileNotFoundError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    return None
 
 
 class Callback(Protocol):
