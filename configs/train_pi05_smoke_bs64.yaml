@@ -1,0 +1,47 @@
+# Smoke test: batch_size=64, a few steps only. Does not touch the 00063 run dir.
+config_name: pi05_aloha
+framework: jax
+
+exp_name: smoke_bs64
+project_name: openpi
+checkpoint_base_dir: ./checkpoint
+assets_base_dir: ./assets
+
+batch_size: 64
+num_train_steps: 8
+seed: 42
+num_workers: 2
+log_interval: 1
+save_interval: 10000
+keep_period: 5000
+max_to_keep: 10
+overwrite: true
+resume: false
+wandb_enabled: false
+fsdp_devices: 1
+ema_decay: 0.99
+
+model:
+  action_horizon: 50
+
+lr_schedule:
+  warmup_steps: 1000
+  peak_lr: 2.5e-5
+  decay_lr: 2.5e-6
+
+optimizer:
+  b1: 0.9
+  b2: 0.95
+  eps: 1.0e-8
+  weight_decay: 1.0e-10
+  clip_gradient_norm: 1.0
+
+data:
+  repo_id: /home/cqcigai/datasets/00063_20260813_RM_01_YJ_21
+  assets:
+    assets_dir: /home/cqcigai/datasets/00063_20260813_RM_01_YJ_21
+    asset_id: "."
+  prompt_from_task: true
+  default_prompt: "Using both hands, pick up the pen box with the left hand and pick up the pen with the right hand. Place the pen into the pen box."
+  adapt_to_pi: false
+  delta_action_dims: [7, 7, -1, -1]

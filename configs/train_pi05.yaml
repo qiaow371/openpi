@@ -1,0 +1,92 @@
+# openpi π0.5 训练配置（字段名对齐 TrainConfig / lr_schedule / optimizer）
+#
+# 用法:
+#   python scripts/train_from_yaml.py --config configs/train_pi05.yaml
+#   python scripts/train_from_yaml.py --config configs/train_pi05.yaml --dry-run
+#
+# config_name 对应 src/openpi/training/config.py 里已注册的 TrainConfig.name
+# （如 pi05_aloha / pi05_aloha_lora / pi05_aloha_pose 等）
+# 下面字段会覆盖该预设；未写的字段保留预设默认值。
+#
+# 训练量（二选一）:
+#   - num_epochs: 标准 epoch，1 epoch = 扫完数据集一遍
+#       num_train_steps = num_epochs * (len(dataset) // batch_size)
+#   - num_train_steps: 纯 step 模式（不设 num_epochs 时使用）
+# 有 num_epochs 时优先，会覆盖预设里的 num_train_steps，并把
+# lr_schedule.decay_steps 设为 resolved num_train_steps。
+
+config_name: pi05_aloha
+# jax | pytorch
+framework: jax
+
+# 省略或 auto 时自动生成：
+#   {policy}_chunk_{N}_lr_{lr}_epochs_{E}[_{abbr}_{val}...]_{YYYYMMDD}
+# 其中 _{abbr}_{val} 仅在数字超参相对 train_pi05.yaml 默认有变化时追加（如 bs_8）；字符串/bool 不参与
+# resume 时填已有 run 名（不要用 auto）
+# exp_name: auto
+exp_name: 00079_jax_PI05_bs32_lr2.5e-4_ah50_YJ
+project_name: openpi
+checkpoint_base_dir: ./checkpoint
+# 仅作默认回退；正式流程用 data.assets.assets_dir 指向数据集里预生成的 norm_stats.json。
+# 训练只把已加载的 norm_stats 拷进 checkpoint 的 assets/，供推理使用（不会现算，也不写 ./assets）。
+assets_base_dir: ./assets
+
+batch_size: 32
+# 标准 epoch 训练（优先于 num_train_steps）
+num_epochs: 30
+# num_train_steps: 30000  # 有 num_epochs 时由代码推算，无需填写
+seed: 42
+num_workers: 0
+log_interval: 100
+# 每 N 个 epoch 存一次 params（推理权重 / EMA）；2 epoch ≈ 3008 step ≈ 3.4h
+save_every_epochs: 1
+# 0 = 不再保存优化器（Adam）；只存推理权重。resume 仍用已有的 full ckpt（3008）。
+save_full_every_epochs: 1
+# save_interval: 1000  # 纯 step 模式再用；有 save_every_epochs 时由代码推算
+keep_period: 5000
+# Orbax 最多同时保留的 checkpoint 份数（按 step 目录计，不是 epoch 数）
+max_to_keep: 10
+overwrite: false
+resume: true
+wandb_enabled: false
+fsdp_devices: 1
+ema_decay: 0.99
+
+# PyTorch 训练时可用
+pytorch_training_precision: bfloat16
+pytorch_weight_path: 
+
+# 模型：action_horizon 等价于 ACT 的 chunk_size（一次预测的动作步数）
+model:
+  action_horizon: 50
+
+# 学习率（CosineDecaySchedule）
+# decay_steps 在 num_epochs 模式下自动设为 resolved num_train_steps
+lr_schedule:
+  warmup_steps: 500
+  peak_lr: 2.5e-4
+  decay_lr: 2.5e-5
+
+# 优化器（AdamW）
+optimizer:
+  b1: 0.9
+  b2: 0.95
+  eps: 1.0e-8
+  weight_decay: 1.0e-10
+  clip_gradient_norm: 1.0
+
+# 数据集与预计算 norm_stats：
+#   1) 先跑: uv run scripts/compute_norm_stats.py --config-name pi05_aloha \
+#            --dataset-dir /path/to/lerobot_dataset
+#      （在数据集根目录写出 norm_stats.json；详见 OpenPI_PI05训练操作手册.md）
+#   2) 下面 assets_dir 通常与 repo_id 相同，asset_id: "." 表示文件就在该目录下
+# 16D: 臂7 | 臂7 | 夹爪1 | 夹爪1；夹爪保持绝对量，关节用 delta
+data:
+  repo_id: /home/cqcigai/datasets/00079_20260821_RM_01_yj_21
+  assets:
+    assets_dir: /home/cqcigai/datasets/00079_20260821_RM_01_yj_21
+    asset_id: "."
+  prompt_from_task: true
+  default_prompt: "Using both hands, pick up the medicines from the green conveyor belt. Place the yellow medicines into the left box and the white medicines into the right box."
+  adapt_to_pi: false
+  delta_action_dims: [7, 7, 1, 1]
