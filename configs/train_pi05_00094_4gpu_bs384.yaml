@@ -1,0 +1,45 @@
+# 00094 / 4×PPU(GPU 0,13,14,15) / 显存拉满配方，与 00073 4 卡同一套 per-card bs 与 LR。
+# 30 epoch × (77842//384)=6060 step；warmup 1334；每 2 epoch 存一次（≈404 step）。
+# num_workers 16→8：主机 256 核 load 已超 300，16 worker 会把另外两路饿死。
+config_name: pi05_aloha
+framework: pytorch
+exp_name: pi05_00094_4gpu_bs384_ep30_sv2ep_20260910
+project_name: openpi
+checkpoint_base_dir: ./checkpoints
+assets_base_dir: ./assets
+batch_size: 384
+num_epochs: 30
+seed: 42
+num_workers: 8
+log_interval: 100
+save_every_epochs: 2
+keep_period: 404
+overwrite: false
+resume: false
+wandb_enabled: false
+fsdp_devices: 4
+ema_decay: 0.99
+pytorch_training_precision: bfloat16
+pytorch_weight_path: /workspace/openpi/models/pi05_fixed
+model:
+  action_horizon: 50
+lr_schedule:
+  warmup_steps: 1334
+  peak_lr: 1.5e-4
+  decay_lr: 1.5e-5
+optimizer:
+  b1: 0.9
+  b2: 0.95
+  eps: 1.0e-8
+  weight_decay: 1.0e-10
+  clip_gradient_norm: 1.0
+data:
+  repo_id: /workspace/openpi/datasets/00094_20260909_RM_03_LLX_ZYN_21
+  assets:
+    assets_dir: /workspace/openpi/datasets/00094_20260909_RM_03_LLX_ZYN_21
+    asset_id: "."
+  default_prompt: "Pick up the cleaning cloth with the hand closest to it and use it to wipe the spill on the table until the surface is clean."
+  prompt_from_task: true
+  prompt_from_subtask: false
+  adapt_to_pi: false
+  delta_action_dims: [7, 7, -1, -1]

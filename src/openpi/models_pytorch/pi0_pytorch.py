@@ -371,7 +371,72 @@ class PI0Pytorch(nn.Module):
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        fm_loss = F.mse_loss(u_t, v_t, reduction="none")
+        ce_tokens = getattr(observation, "tokenized_subtask_ce", None)
+        if ce_tokens is None:
+            return fm_loss
+
+        ce_loss = self._subtask_ce_loss(
+            images,
+            img_masks,
+            ce_tokens,
+            observation.tokenized_subtask_ce_mask,
+            observation.tokenized_subtask_ce_labels,
+        )
+        w = float(getattr(self, "subtask_ce_weight", 1.0))
+        fm_mean = fm_loss.mean()
+        return {
+            "loss": fm_mean + w * ce_loss,
+            "fm_loss": fm_mean,
+            "ce_loss": ce_loss,
+        }
+
+    def _subtask_ce_loss(self, images, img_masks, ce_tokens, ce_masks, ce_labels) -> Tensor:
+        """PaliGemma language CE: Task+images → subtask. Does not condition action FM."""
+        micro = int(getattr(self, "subtask_ce_microbatch", 8) or 8)
+        bsz = ce_tokens.shape[0]
+        if micro < bsz:
+            idx = torch.randperm(bsz, device=ce_tokens.device)[:micro]
+            images = [im.index_select(0, idx) for im in images]
+            img_masks = [m.index_select(0, idx) for m in img_masks]
+            ce_tokens = ce_tokens.index_select(0, idx)
+            ce_masks = ce_masks.index_select(0, idx)
+            ce_labels = ce_labels.index_select(0, idx)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, ce_tokens, ce_masks)
+        if prefix_embs.dtype != torch.bfloat16 and self.paligemma_with_expert.paligemma.language_model.layers[
+            0
+        ].self_attn.q_proj.weight.dtype == torch.bfloat16:
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+        att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks).to(dtype=prefix_embs.dtype)
+        position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        def ce_forward(prefix_embs, att_2d_masks_4d, position_ids):
+            outputs, _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=False,
+                adarms_cond=[None, None],
+            )
+            return outputs[0]
+
+        prefix_out = self._apply_checkpoint(ce_forward, prefix_embs, att_2d_masks_4d, position_ids)
+        n_lang = ce_tokens.shape[1]
+        lang_h = prefix_out[:, -n_lang:, :]
+        lm_head = self.paligemma_with_expert.paligemma.lm_head
+        logits = lm_head(lang_h.to(dtype=lm_head.weight.dtype)).float()
+        shift_logits = logits[:, :-1].contiguous()
+        shift_labels = ce_labels[:, 1:].to(dtype=torch.long, device=logits.device).contiguous()
+        if not (shift_labels != -100).any():
+            return logits.float().sum() * 0.0
+        return F.cross_entropy(
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
+            ignore_index=-100,
+        )
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:

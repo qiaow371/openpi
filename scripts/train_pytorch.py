@@ -575,6 +575,16 @@ def train_loop(config: _config.TrainConfig):
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    object.__setattr__(
+        model,
+        "subtask_ce_weight",
+        float(getattr(config.data, "subtask_ce_weight", 1.0) or 1.0),
+    )
+    object.__setattr__(
+        model,
+        "subtask_ce_microbatch",
+        int(getattr(config.data, "subtask_ce_microbatch", 8) or 8),
+    )
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -603,7 +613,7 @@ def train_loop(config: _config.TrainConfig):
             device_ids=[device.index] if device.type == "cuda" else None,
             find_unused_parameters=True,  # Disable for memory efficiency
             gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
+            static_graph=world_size >= 8 and not bool(getattr(config.data, "subtask_ce", False)),
         )
 
     # Load weights from weight_loader if specified (for fine-tuning)
@@ -730,13 +740,21 @@ def train_loop(config: _config.TrainConfig):
 
             # Forward pass
             losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
+            fm_loss_v = None
+            ce_loss_v = None
+            if isinstance(losses, dict):
+                loss = losses["loss"]
+                if "fm_loss" in losses:
+                    fm_loss_v = float(losses["fm_loss"].detach())
+                if "ce_loss" in losses:
+                    ce_loss_v = float(losses["ce_loss"].detach())
+            elif isinstance(losses, list | tuple):
                 losses = torch.stack(losses)
+                loss = losses.mean()
             elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
-
-            loss = losses.mean()
+                loss = torch.tensor(losses, device=device, dtype=torch.float32)
+            else:
+                loss = losses.mean()
 
             # Backward pass
             loss.backward()
@@ -761,13 +779,16 @@ def train_loop(config: _config.TrainConfig):
 
             # Collect stats
             if is_main:
-                infos.append(
-                    {
-                        "loss": loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                    }
-                )
+                info = {
+                    "loss": loss.item(),
+                    "learning_rate": optim.param_groups[0]["lr"],
+                    "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                }
+                if fm_loss_v is not None:
+                    info["fm_loss"] = fm_loss_v
+                if ce_loss_v is not None:
+                    info["ce_loss"] = ce_loss_v
+                infos.append(info)
 
             if is_main and (global_step % config.log_interval == 0) and infos:
                 elapsed = time.time() - start_time
@@ -775,6 +796,16 @@ def train_loop(config: _config.TrainConfig):
                 # Average stats over log interval
                 avg_loss = sum(info["loss"] for info in infos) / len(infos)
                 avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
+                avg_fm = None
+                avg_ce = None
+                if any("fm_loss" in info for info in infos):
+                    avg_fm = sum(info["fm_loss"] for info in infos if "fm_loss" in info) / max(
+                        1, sum(1 for info in infos if "fm_loss" in info)
+                    )
+                if any("ce_loss" in info for info in infos):
+                    avg_ce = sum(info["ce_loss"] for info in infos if "ce_loss" in info) / max(
+                        1, sum(1 for info in infos if "ce_loss" in info)
+                    )
 
                 avg_grad_norm = None
                 if any("grad_norm" in info for info in infos):
@@ -793,11 +824,13 @@ def train_loop(config: _config.TrainConfig):
                         epoch=(global_step / steps_per_epoch) if steps_per_epoch else None,
                     )
                 )
-                # Keep a human-readable summary as well.
+                extra = ""
+                if avg_fm is not None and avg_ce is not None:
+                    extra = f" fm={avg_fm:.4f} ce={avg_ce:.4f}"
                 logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
+                    f"step={global_step} loss={avg_loss:.4f}{extra} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
                     if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
+                    else f"step={global_step} loss={avg_loss:.4f}{extra} lr={avg_lr:.2e} time={elapsed:.1f}s"
                 )
 
                 while loss_steps and loss_steps[-1] >= int(global_step):

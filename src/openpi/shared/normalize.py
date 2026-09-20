@@ -1,19 +1,18 @@
+import dataclasses
 import json
 import logging
 import pathlib
 
 import flax.traverse_util
 import numpy as np
-import numpydantic
-import pydantic
 
 
-@pydantic.dataclasses.dataclass
+@dataclasses.dataclass
 class NormStats:
-    mean: numpydantic.NDArray
-    std: numpydantic.NDArray
-    q01: numpydantic.NDArray | None = None  # 1st quantile
-    q99: numpydantic.NDArray | None = None  # 99th quantile
+    mean: np.ndarray
+    std: np.ndarray
+    q01: np.ndarray | None = None  # 1st quantile
+    q99: np.ndarray | None = None  # 99th quantile
 
 
 class RunningStats:
@@ -119,18 +118,27 @@ class RunningStats:
         return results
 
 
-class _NormStatsDict(pydantic.BaseModel):
-    norm_stats: dict[str, NormStats]
-
-
 def serialize_json(norm_stats: dict[str, NormStats]) -> str:
     """Serialize the running statistics to a JSON string."""
-    return _NormStatsDict(norm_stats=norm_stats).model_dump_json(indent=2)
+    data = {
+        "norm_stats": {
+            key: {
+                field.name: value.tolist() if isinstance(value, np.ndarray) else value
+                for field in dataclasses.fields(stats)
+                if (value := getattr(stats, field.name)) is not None
+            }
+            for key, stats in norm_stats.items()
+        }
+    }
+    return json.dumps(data, indent=2)
 
 
 def deserialize_json(data: str) -> dict[str, NormStats]:
     """Deserialize the running statistics from a JSON string."""
-    return _NormStatsDict(**json.loads(data)).norm_stats
+    return {
+        key: NormStats(**{field: np.asarray(value) for field, value in stats.items()})
+        for key, stats in json.loads(data)["norm_stats"].items()
+    }
 
 
 def save(directory: pathlib.Path | str, norm_stats: dict[str, NormStats]) -> None:

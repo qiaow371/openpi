@@ -257,6 +257,11 @@ class RepackTransform(DataTransformFn):
             raise KeyError(f"Missing key in input data: {k}")
         
         result = jax.tree.map(get_value, self.structure)
+        # Keep language/CE fields that the LeRobot sample already has; the
+        # structure map usually only lists images/state/actions.
+        for k in ("prompt", "subtask", "episode_index", "frame_index"):
+            if k in data and k not in result:
+                result[k] = data[k]
         return result
 
 
@@ -702,6 +707,30 @@ class TokenizePrompt(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class TokenizeSubtaskCE(DataTransformFn):
+    """Keep the task prompt for action FM; tokenize subtask as a CE target."""
+
+    tokenizer: _tokenizer.PaligemmaTokenizer
+
+    def __call__(self, data: DataDict) -> DataDict:
+        prompt = data.get("prompt", "")
+        if not isinstance(prompt, str):
+            prompt = prompt.item() if hasattr(prompt, "item") else str(prompt)
+        sub = data.get("subtask", "")
+        if not isinstance(sub, str):
+            sub = sub.item() if hasattr(sub, "item") else str(sub)
+        tokens, mask, labels = self.tokenizer.tokenize_subtask_ce(prompt, sub)
+        out = {
+            **data,
+            "tokenized_subtask_ce": tokens,
+            "tokenized_subtask_ce_mask": mask,
+            "tokenized_subtask_ce_labels": labels,
+        }
+        out.pop("subtask", None)  # string field cannot be torch.as_tensor'd in collate
+        return out
+
+
+@dataclasses.dataclass(frozen=True)
 class TokenizeFASTInputs(DataTransformFn):
     tokenizer: _tokenizer.FASTTokenizer
 
@@ -813,6 +842,28 @@ class PromptFromSubtaskSpans(DataTransformFn):
             if t0 <= fr < t1:
                 return {**data, "prompt": text}
         return data
+
+
+@dataclasses.dataclass(frozen=True)
+class AttachSubtaskFromSpans(DataTransformFn):
+    """Write per-frame ``subtask`` for CE without replacing the task prompt."""
+
+    spans: dict[int, tuple[tuple[int, int, str], ...]]
+
+    @classmethod
+    def from_jsonl(cls, path: str | pathlib.Path) -> "AttachSubtaskFromSpans":
+        loaded = PromptFromSubtaskSpans.from_jsonl(path)
+        return cls(spans=loaded.spans)
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "episode_index" not in data or "frame_index" not in data:
+            return data
+        ep = _as_int(data["episode_index"])
+        fr = _as_int(data["frame_index"])
+        for t0, t1, text in self.spans.get(ep, ()):
+            if t0 <= fr < t1:
+                return {**data, "subtask": text}
+        return {**data, "subtask": data.get("subtask", "")}
 
 
 @dataclasses.dataclass(frozen=True)

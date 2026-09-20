@@ -9,7 +9,16 @@
 #
 # ssh -F ssh_config jiangsuan-16
 # bash /nvme1n1/openpi/cigai_train/openpi-jiangsuan/scripts/start_train_00036_4way.sh
+#
+# 2026-09-07: 00036 当前配方是 16 卡 task-prompt FM + subtask CE
+# （scripts/start_train_00036_16gpu_task_ce.sh）。不要再拉 e1 prompt_from_subtask。
+# 强制旧四路: FORCE_4WAY=1 bash $0
 set -euo pipefail
+if [[ "${FORCE_4WAY:-0}" != "1" ]]; then
+  echo "[refused] 00036 已切到 start_train_00036_16gpu_task_ce.sh（整段 PROMPT 做 action 条件，CE 训 subtask VLM）。"
+  echo "          旧四路需要 FORCE_4WAY=1"
+  exit 1
+fi
 
 OPENPI_DOCKER="${OPENPI_DOCKER:-openpi_train}"
 OPENPI_REPO="${OPENPI_REPO:-/workspace/openpi/cigai_train/openpi-jiangsuan}"

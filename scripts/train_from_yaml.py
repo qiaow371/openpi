@@ -134,6 +134,10 @@ def main() -> None:
     print(f"repo_id:     {repo_id}")
     print(f"prompt_from_task:    {prompt_task}")
     print(f"prompt_from_subtask: {prompt_sub}")
+    subtask_ce = bool(getattr(data_cfg, "subtask_ce", False))
+    print(f"subtask_ce:          {subtask_ce}")
+    if subtask_ce:
+        print(f"subtask_ce_weight:   {getattr(data_cfg, 'subtask_ce_weight', 1.0)}")
     print(f"trainable_modules:   {getattr(cfg, 'trainable_modules', 'all')}")
     stage2 = getattr(cfg, "stage2_trainable_modules", None)
     if stage2:
@@ -141,7 +145,7 @@ def main() -> None:
         epoch = getattr(cfg, "stage2_start_epoch", None)
         when = f"step {step}" if step is not None else f"epoch {epoch}"
         print(f"stage2_trainable:    {stage2} @ {when}")
-    if prompt_sub:
+    if prompt_sub or subtask_ce:
         from openpi.training.data_loader import inspect_subtask_sidecar
 
         cov = inspect_subtask_sidecar(str(repo_id) if repo_id else None)

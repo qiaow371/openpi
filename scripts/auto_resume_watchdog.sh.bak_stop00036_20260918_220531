@@ -1,0 +1,120 @@
+#!/bin/bash
+# auto_resume_watchdog.sh —— 2 路 x8卡 pi05 训练自动守护（中断 → 立即 resume）(20260916 改造)
+#   监控对象：00036_ah100、00086_ah100（openpi_train 容器内 8 卡任务）
+#   判定中断：容器内该 yaml 的 train_from_yaml 进程消失
+#   防误判①：进程在就只观察（dataloader 冷启动停顿最长 ~25min，不会误判）
+#   防误判②：日志末步 >= 总步数 → 任务已完成，不再重启
+#   hang 兜底：进程在但日志 mtime 超 STALE_KILL_SEC → 视为 hang，kill 后 resume
+#   resume：有 ckpt 用 --resume；无 ckpt（首存前中断）从头重跑；日志追加并插分隔线
+#   防抖：同任务 300s 内只 resume 一次，防止启动即崩导致无限循环
+# 启动：setsid nohup bash /nvme1n1/openpi/cigai_train/openpi-jiangsuan/scripts/auto_resume_watchdog.sh &
+set -uo pipefail
+
+CHECK_INTERVAL=60
+STALE_KILL_SEC=10800      # 3h 无日志更新且进程在 → hang
+OPENPI_DOCKER=openpi_train
+OPENPI_REPO=/workspace/openpi/cigai_train/openpi-jiangsuan
+HOST_OPENPI=/nvme1n1/openpi
+HOST_REPO=/nvme1n1/openpi/cigai_train/openpi-jiangsuan
+CKPT_BASE=$HOST_REPO/checkpoints
+WATCH_LOG=$HOST_OPENPI/auto_resume_watchdog.log
+PID_FILE=$HOST_OPENPI/auto_resume_watchdog.pid
+
+# name|yaml|gpus|port|total_steps|host_log
+JOBS=(
+  "00036_ah100|configs/train_pi05_00036_4gpu_bs384_ah100.yaml|0,1,2,3,4,5,6,7|29796|13100|$HOST_OPENPI/train_00036_4gpu_bs384_ah100.log"
+  "00086_ah100|configs/train_pi05_00086_4gpu_bs384_ah100.yaml|8,9,10,11,12,13,14,15|29798|33500|$HOST_OPENPI/train_00086_4gpu_bs384_ah100.log"
+)
+
+log(){ echo "$(date '+%F %T') $*" >> "$WATCH_LOG"; }
+
+if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+  echo "[skip] watchdog already running (pid $(cat "$PID_FILE"))"; exit 0
+fi
+echo $$ > "$PID_FILE"
+log "=== watchdog start (pid $$, interval ${CHECK_INTERVAL}s, stale_kill=${STALE_KILL_SEC}s) ==="
+
+last_step(){
+  # 宿主机日志 → 最后的当前步；无日志/无进度行输出 -1
+  [ -f "$1" ] || { echo -1; return; }
+  tr '\r' '\n' < "$1" | grep -a 'Training:' | tail -1 \
+    | grep -oE '\| [0-9]+/[0-9]+ \[' | grep -oE '[0-9]+' | head -1
+}
+
+job_alive(){
+  docker exec "$OPENPI_DOCKER" bash -lc \
+    "pgrep -af 'train_from_yaml.py --config $1' | grep -v pgrep || true" | grep -q train_from_yaml
+}
+
+kill_job(){
+  docker exec "$OPENPI_DOCKER" bash -lc "
+    pkill -f 'train_from_yaml.py --config $1' 2>/dev/null || true
+    pkill -f 'master_port=$2' 2>/dev/null || true
+    sleep 2
+  " >/dev/null 2>&1 || true
+}
+
+do_resume(){
+  local name=$1 yaml=$2 gpus=$3 port=$4 hlog=$5
+  local now lr
+  now=$(date +%s); lr=${LAST_RESUME[$name]:-0}
+  if [ $((now - lr)) -lt 300 ]; then
+    log "[$name] 300s 内已 resume 过，本轮跳过"; return
+  fi
+  LAST_RESUME[$name]=$now
+  local cont_log="/workspace/openpi/$(basename "$hlog")"
+  local flag="" exp ckpt_dir
+  exp=$(grep -E '^exp_name:' "$HOST_REPO/$yaml" 2>/dev/null | awk '{print $2}')
+  ckpt_dir="$CKPT_BASE/$exp/checkpoints"
+  if [ -n "$exp" ] && ls "$ckpt_dir" 2>/dev/null | grep -qE '^0[0-9]+$'; then
+    flag="--resume"
+  fi
+  kill_job "$yaml" "$port"
+  sleep 3
+  docker exec -d "$OPENPI_DOCKER" bash -lc "
+set -euo pipefail
+cd $OPENPI_REPO
+export PYTHONPATH=\$(pwd)/src:\$(pwd)/packages/openpi-client/src:\$(pwd)/cigia_lerobot/src
+export PALIGEMMA_TOKENIZER_PATH=/workspace/openpi/models/pi05_fixed/tokenizer.model
+export TORCHDYNAMO_DISABLE=1
+export TORCH_COMPILE_DISABLE=1
+export CUDA_VISIBLE_DEVICES=$gpus
+echo \"===== watchdog resume \$(date '+%F %T') flag=$flag =====\" >> $cont_log
+setsid python3 -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=8 --master_port=$port \
+  scripts/train_from_yaml.py --config $yaml $flag >> $cont_log 2>&1
+"
+  log "[$name] RESUMED gpus=$gpus port=$port flag='$flag' (ckpt_dir=$ckpt_dir)"
+}
+
+declare -A LAST_RESUME
+loop_no=0
+while true; do
+  loop_no=$((loop_no+1))
+  summary=""
+  for j in "${JOBS[@]}"; do
+    IFS='|' read -r name yaml gpus port total hlog <<< "$j"
+    st=$(last_step "$hlog"); st=${st:--1}
+    if [ "$st" -ge "$total" ] 2>/dev/null; then
+      summary="$summary $name=DONE"; continue
+    fi
+    if job_alive "$yaml"; then
+      summary="$summary $name=ok(step$st)"
+      if [ -f "$hlog" ]; then
+        age=$(( $(date +%s) - $(stat -c %Y "$hlog") ))
+        if [ "$age" -gt "$STALE_KILL_SEC" ]; then
+          log "[$name] HANG? 日志 ${age}s 未更新且进程在 → kill + resume"
+          do_resume "$name" "$yaml" "$gpus" "$port" "$hlog"
+        fi
+      fi
+    else
+      log "[$name] 进程消失 (最后step=$st/$total) → resume"
+      summary="$summary $name=RESUMING"
+      do_resume "$name" "$yaml" "$gpus" "$port" "$hlog"
+    fi
+  done
+  # 每 30 轮（~30min）打一行心跳，避免日志静默无法确认 watchdog 存活
+  if [ $((loop_no % 30)) -eq 1 ]; then
+    log "loop#$loop_no |$summary"
+  fi
+  sleep "$CHECK_INTERVAL"
+done

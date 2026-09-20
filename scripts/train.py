@@ -327,27 +327,9 @@ def main(config: _config.TrainConfig):
             infos = []
         batch = next(data_iter)
 
-        is_last = step == config.num_train_steps - 1
-        should_save = (step % config.save_interval == 0 and step > start_step) or is_last
-        if config.save_full_interval is not None:
-            should_save = should_save or (
-                step % config.save_full_interval == 0 and step > start_step
-            )
-        if should_save:
-            include_train_state = (
-                config.save_full_interval is None
-                or is_last
-                or (step % config.save_full_interval == 0)
-            )
-            kind = "full" if include_train_state else "params-only"
-            logging.info("Checkpoint %s after step %s", kind, step)
-            _checkpoints.save_state(
-                checkpoint_manager,
-                train_state,
-                data_loader,
-                step,
-                include_train_state=include_train_state,
-            )
+        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+            logging.info(f"Checkpoint policy after step {step}")
+            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
             checkpoint_manager.wait_until_finished()
             if jax.process_index() == 0:
                 try:

@@ -94,6 +94,11 @@ class DataConfig:
     # If true and ``<repo>/meta/subtask_spans.jsonl`` exists, overwrite prompt
     # per frame with the matching subtask (π0.5 ˆℓ). Misses keep the global task.
     prompt_from_subtask: bool = False
+    # If true, keep the task prompt for action FM and add PaliGemma CE on the
+    # matching subtask text (Task+images → subtask). Sidecar still required.
+    subtask_ce: bool = False
+    subtask_ce_weight: float = 1.0
+    subtask_ce_microbatch: int = 8
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -254,6 +259,10 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     prompt_from_task: bool = True
     # YAML: data.prompt_from_subtask: true  （需要 meta/episodes_detailed_task.jsonl）
     prompt_from_subtask: bool = False
+    # YAML: data.subtask_ce: true  — FM 仍用 task prompt；VLM 对 subtask 做 CE
+    subtask_ce: bool = False
+    subtask_ce_weight: float = 1.0
+    subtask_ce_microbatch: int = 8
     # If true, this will convert the joint and gripper values from the standard Aloha space to
     # the space used by the pi internal runtime which was used to train the base model. People who
     # use standard Aloha data should set this to true.
@@ -295,6 +304,18 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             )
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        if self.subtask_ce:
+            tok = _tokenizer.PaligemmaTokenizer(model_config.max_token_len)
+            new_inputs = []
+            inserted = False
+            for t in model_transforms.inputs:
+                if isinstance(t, _transforms.TokenizePrompt) and not inserted:
+                    new_inputs.append(_transforms.TokenizeSubtaskCE(tokenizer=tok))
+                    inserted = True
+                new_inputs.append(t)
+            if not inserted:
+                new_inputs.append(_transforms.TokenizeSubtaskCE(tokenizer=tok))
+            model_transforms = dataclasses.replace(model_transforms, inputs=tuple(new_inputs))
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -304,6 +325,9 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             action_sequence_keys=self.action_sequence_keys,
             prompt_from_task=self.prompt_from_task,
             prompt_from_subtask=self.prompt_from_subtask,
+            subtask_ce=self.subtask_ce,
+            subtask_ce_weight=self.subtask_ce_weight,
+            subtask_ce_microbatch=self.subtask_ce_microbatch,
         )
 
 

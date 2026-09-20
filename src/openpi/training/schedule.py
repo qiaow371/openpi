@@ -47,7 +47,6 @@ def resolve_epoch_schedule(config: _config.TrainConfig) -> _config.TrainConfig:
     - ``num_train_steps = num_epochs * steps_per_epoch``
     - ``lr_schedule.decay_steps = num_train_steps`` (when the schedule has that field)
     - ``save_interval = save_every_epochs * steps_per_epoch`` (when ``save_every_epochs`` is set)
-    - ``save_full_interval = save_full_every_epochs * steps_per_epoch`` (when set)
 
     Idempotent for already-resolved configs that still carry ``num_epochs``.
     """
@@ -57,12 +56,6 @@ def resolve_epoch_schedule(config: _config.TrainConfig) -> _config.TrainConfig:
                 "save_every_epochs=%s ignored because num_epochs is not set; using save_interval=%s",
                 config.save_every_epochs,
                 config.save_interval,
-            )
-        if config.save_full_every_epochs is not None:
-            logging.warning(
-                "save_full_every_epochs=%s ignored because num_epochs is not set; using save_full_interval=%s",
-                config.save_full_every_epochs,
-                config.save_full_interval,
             )
         return config
 
@@ -92,38 +85,10 @@ def resolve_epoch_schedule(config: _config.TrainConfig) -> _config.TrainConfig:
             raise ValueError(f"save_every_epochs must be positive, got {config.save_every_epochs}")
         replace_kwargs["save_interval"] = save_every * steps_per_epoch
 
-    if config.save_full_every_epochs is not None:
-        save_full_every = int(config.save_full_every_epochs)
-        if save_full_every <= 0:
-            raise ValueError(f"save_full_every_epochs must be positive, got {config.save_full_every_epochs}")
-        save_full_interval = save_full_every * steps_per_epoch
-        replace_kwargs["save_full_interval"] = save_full_interval
-        save_interval = replace_kwargs.get("save_interval", config.save_interval)
-        if save_full_interval % int(save_interval) != 0:
-            logging.warning(
-                "save_full_interval=%s is not a multiple of save_interval=%s; "
-                "full checkpoints may not land on a params-save step",
-                save_full_interval,
-                save_interval,
-            )
-        # Orbax max_to_keep deletes non-keep_period steps. Pin keep_period to the
-        # full-save cadence so --resume still finds train_state.
-        keep_period = config.keep_period
-        if keep_period is None or save_full_interval % int(keep_period) != 0:
-            logging.warning(
-                "keep_period=%s would not retain full checkpoints at step %% %s == 0; "
-                "setting keep_period=%s",
-                keep_period,
-                save_full_interval,
-                save_full_interval,
-            )
-            replace_kwargs["keep_period"] = save_full_interval
-
     resolved = dataclasses.replace(config, **replace_kwargs)
     logging.info(
         "Epoch schedule: num_epochs=%s dataset_len=%s%s batch_size=%s "
-        "steps_per_epoch=%s num_train_steps=%s save_interval=%s save_full_interval=%s "
-        "keep_period=%s decay_steps=%s",
+        "steps_per_epoch=%s num_train_steps=%s save_interval=%s decay_steps=%s",
         num_epochs,
         num_samples,
         " (approximate)" if approximate else "",
@@ -131,8 +96,6 @@ def resolve_epoch_schedule(config: _config.TrainConfig) -> _config.TrainConfig:
         steps_per_epoch,
         resolved.num_train_steps,
         resolved.save_interval,
-        resolved.save_full_interval,
-        resolved.keep_period,
         getattr(resolved.lr_schedule, "decay_steps", None),
     )
     return resolved

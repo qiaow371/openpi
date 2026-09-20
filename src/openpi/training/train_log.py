@@ -405,6 +405,8 @@ def save_train_config(
     prompt_meta = {
         "prompt_from_task": bool(getattr(data, "prompt_from_task", False)) if data is not None else None,
         "prompt_from_subtask": bool(getattr(data, "prompt_from_subtask", False)) if data is not None else None,
+        "subtask_ce": bool(getattr(data, "subtask_ce", False)) if data is not None else None,
+        "subtask_ce_weight": getattr(data, "subtask_ce_weight", None) if data is not None else None,
         "repo_id": getattr(data, "repo_id", None) if data is not None else None,
     }
     try:

@@ -1,11 +1,10 @@
 """Compute normalization statistics for a config.
 
-Writes ``norm_stats.json`` to the **dataset root** (``data.repo_id``), not
-``assets_base_dir``. Point YAML ``data.assets.assets_dir`` at that same path
-with ``asset_id: "."`` so training loads it and copies into the checkpoint.
+This script is used to compute the normalization statistics for a given config. It
+will compute the mean and standard deviation of the data in the dataset and save it
+to the config assets directory.
 """
 
-import dataclasses
 import json
 import pathlib
 
@@ -273,66 +272,15 @@ def _load_lerobot_stats(directory: pathlib.Path, repack_transform: transforms.Re
     return result
 
 
-def main(
-    config_name: str = "pi05_aloha",
-    max_frames: int | None = None,
-    dataset_dir: pathlib.Path | None = None,
-    train_yaml: pathlib.Path | None = None,
-):
-    """Compute norm stats.
-
-    Args:
-        config_name: Registered TrainConfig name (e.g. pi05_aloha).
-        max_frames: Optional cap on frames used for stats.
-        dataset_dir: Optional local dataset root. When set, overrides ``repo_id``
-            / ``assets`` for this run and writes ``norm_stats.json`` there.
-        train_yaml: Optional train yaml (same file as train_from_yaml). When set,
-            uses its data.delta_action_dims / repo_id / assets so stats match training.
-    """
-    if train_yaml is not None:
-        scripts_dir = pathlib.Path(__file__).resolve().parent
-        if str(scripts_dir) not in __import__("sys").path:
-            __import__("sys").path.insert(0, str(scripts_dir))
-        from train_from_yaml import load_train_config
-
-        config, _ = load_train_config(pathlib.Path(train_yaml))
-    else:
-        config = _config.get_config(config_name)
-    if dataset_dir is not None:
-        dataset_dir = dataset_dir.expanduser().resolve()
-        if not dataset_dir.is_dir():
-            raise FileNotFoundError(f"Dataset root does not exist: {dataset_dir}")
-        assets = dataclasses.replace(
-            config.data.assets,
-            assets_dir=str(dataset_dir),
-            asset_id=".",
-        )
-        config = dataclasses.replace(
-            config,
-            data=dataclasses.replace(config.data, repo_id=str(dataset_dir), assets=assets),
-        )
-
+def main(config_name: str, max_frames: int | None = None):
+    config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
 
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
 
-    # Local absolute/relative dataset roots: write norm_stats.json onto the dataset.
-    # HuggingFace-style ids (e.g. "org/name") keep the legacy assets_base_dir output.
-    repo_path = pathlib.Path(data_config.repo_id).expanduser()
-    write_on_dataset = repo_path.is_absolute() or repo_path.exists()
-    if write_on_dataset:
-        dataset_root = repo_path.resolve()
-        if not dataset_root.is_dir():
-            raise FileNotFoundError(f"Dataset root does not exist: {dataset_root}")
-        output_path = dataset_root
-    else:
-        dataset_root = repo_path
-        output_path = pathlib.Path(config.assets_dirs)
-        print(
-            f"repo_id={data_config.repo_id!r} is not a local directory; "
-            f"writing norm_stats under assets_base_dir: {output_path}"
-        )
+    dataset_root = pathlib.Path(data_config.repo_id)
+    output_path = pathlib.Path(config.assets_dirs)
 
     repack_transform = None
     if hasattr(data_config, "repack_transforms") and data_config.repack_transforms:
@@ -377,17 +325,14 @@ def main(
             norm_stats[key] = value
             print(f"Copied stats for key: {key}")
 
-    # Ensure state and actions are always recomputed (not copied from existing stats)
     if "state" in existing_stats:
         print("Note: 'state' stats were found in meta/stats.json but will be recomputed")
     if "actions" in existing_stats:
         print("Note: 'actions' stats were found in meta/stats.json but will be recomputed")
 
-    print(f"Writing stats to: {output_path / 'norm_stats.json'}")
+    print(f"Writing stats to: {output_path}")
     print(f"Total keys in output: {len(norm_stats)}")
     normalize.save(output_path, norm_stats)
-    if write_on_dataset:
-        print('Point data.assets.assets_dir at this dataset and set asset_id: "." for training.')
 
 
 if __name__ == "__main__":

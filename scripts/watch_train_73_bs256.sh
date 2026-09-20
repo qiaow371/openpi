@@ -1,0 +1,116 @@
+#!/bin/bash
+# 监控 00073 π0.5 双路 bs384 训练（2026-09-10 19:45 起别人改用 bs384 配置；bs256 版已停）（GPU5-8 chunk15 / GPU9-12 chunk75）。
+#
+#   bash watch_train_73_bs256.sh                # 打印一次快照
+#   bash watch_train_73_bs256.sh --loop 300     # 每 300s 记一次心跳，异常写 ALERT 文件
+#
+# 告警判据：① 进程数 < 6（bash 包装+torchrun+4 rank 掉线）② 日志 > STALE_SEC 没更新（默认 1800s，卡住）
+#          ③ 日志里出现 Traceback / CUDA out of memory / loss=nan|inf。
+# 心跳 -> /nvme1n1/openpi/train_00073_watch.log；告警 -> /nvme1n1/openpi/train_00073_watch.ALERT
+set -uo pipefail
+
+LOG_DIR=/nvme1n1/openpi
+CKPT_ROOT=$LOG_DIR/cigai_train/openpi-jiangsuan/checkpoints
+STATE=$LOG_DIR/train_00073_watch.state
+WATCH_LOG=$LOG_DIR/train_00073_watch.log
+ALERT=$LOG_DIR/train_00073_watch.ALERT
+STALE_SEC=${STALE_SEC:-1800}
+EXPECT_PROCS=6           # bash 包装 1 + torchrun 1 + 4 个 rank
+
+# name | stdout 日志 | yaml | run 目录 | 卡 | 总步数 | 每多少步存
+RUNS=(
+  "chunk15|train_00073_4gpu_bs384_ah15.log|configs/train_pi05_73_4gpu_bs384_ah15.yaml|pi05_73_4gpu_bs384_chunk15_lr1.5e-4_20260910|5,6,7,8|50500|1515"
+  "chunk75|train_00073_4gpu_bs384_ah75.log|configs/train_pi05_73_4gpu_bs384_ah75.yaml|pi05_73_4gpu_bs384_chunk75_lr1.5e-4_20260910|9,10,11,12|50500|1515"
+)
+
+num() { grep -oE '[-0-9]+\.?[0-9]*' <<<"$1" | head -1; }
+
+# 上次心跳记的 (step, time)，用来算真实 s/step
+state_get() { awk -F'[=|]' -v k="$1" '$1==k{print $2" "$3}' "$STATE" 2>/dev/null | tail -1; }
+state_put() {
+  local tmp="$STATE.new"
+  { grep -av "^$1=" "$STATE" 2>/dev/null; echo "$1=$2|$(date +%s)"; } > "$tmp" && mv "$tmp" "$STATE"
+}
+
+snap_one() {
+  local name="$1" log="$2" yaml="$3" run_dir="$4" gpus="$5" total="$6" save_every="$7"
+  local f="$LOG_DIR/$log"
+  local alerts
+  alerts=$(mktemp)
+
+  : > "$alerts"
+  if [[ ! -f "$f" ]]; then
+    printf '  %-8s 日志不存在: %s\n' "$name" "$f"
+    echo "$name: 日志缺失 $f" >> "$alerts"
+  else
+    local bar step loss rate elapsed alive age bad nckpt next_ckpt
+    bar=$(tr '\r' '\n' < "$f" | grep -a 'Training:' | tail -1)
+    step=$(num "$(grep -oE '\| [0-9]+/[0-9]+ \[' <<<"$bar")")
+    loss=$(grep -oE 'loss=[0-9.eE+-]+' <<<"$bar" | tail -1 | cut -d= -f2)
+    rate=$(grep -oE '[0-9.]+s/it' <<<"$bar" | tail -1)
+    elapsed=$(grep -oE '\[[0-9:]+' <<<"$bar" | tail -1 | tr -d '[')
+    step=${step:-0}
+    alive=$(pgrep -fc "python.*train_from_yaml.py --config ${yaml}" || true); alive=${alive:-0}
+    age=$(( $(date +%s) - $(stat -c %Y "$f") ))
+    bad=$(grep -acE 'Traceback|CUDA out of memory|loss[:= ]*nan|loss[:= ]*inf|Killed' "$f" 2>/dev/null || true); bad=${bad:-0}
+    nckpt=$(find "$CKPT_ROOT/$run_dir/checkpoints" -maxdepth 1 -type d -name '[0-9]*' 2>/dev/null | wc -l)
+    next_ckpt=$(( (step / save_every + 1) * save_every ))
+
+    printf '  %-8s step %s/%s  loss=%s  %s  已跑=%s  进程=%s/%s  日志%s前动过  已有ckpt×%s  下次存@%s\n' \
+      "$name" "$step" "$total" "${loss:-?}" "${rate:-?}" "${elapsed:-?}" "$alive" "$EXPECT_PROCS" "$age" "$nckpt" "$next_ckpt"
+
+    # 真实吞吐 + 按它估算下次 ckpt 还要多久
+    local read_rate=${rate%s/it} prev pstep ptime ds dt
+    read_rate=${read_rate:-0}
+    prev=$(state_get "$name"); pstep=$(awk '{print $1}' <<<"$prev"); ptime=$(awk '{print $2}' <<<"$prev")
+    if [[ -n "$pstep" && -n "$ptime" ]]; then
+      ds=$(( step - pstep )); dt=$(( $(date +%s) - ptime ))
+      (( ds > 0 && dt > 0 )) && read_rate=$(awk -v d=$dt -v s=$ds 'BEGIN{printf "%.1f", d/s}')
+    fi
+    (( next_ckpt > step )) && printf '           真实 %ss/step；距下次 ckpt %s 步 ≈ %.1f 天\n' \
+      "$read_rate" "$(( next_ckpt - step ))" "$(awk -v n=$(( next_ckpt - step )) -v r="$read_rate" 'BEGIN{print n*r/3600/24}')"
+    printf '           GPU[%s] %s\n' "$gpus" "$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader 2>/dev/null \
+      | awk -F', ' -v g="$gpus" 'BEGIN{n=split(g,a,",");for(i=1;i<=n;i++)want[a[i]]=1} want[$1]{printf "%s:%s/%s  ", $1,$2,$3}')"
+    state_put "$name" "$step"
+
+    (( alive < EXPECT_PROCS )) && echo "$name: 进程只剩 $alive/$EXPECT_PROCS，训练可能挂了" >> "$alerts"
+    (( age > STALE_SEC )) && echo "$name: 日志 ${age}s 没出新内容（阈值 ${STALE_SEC}s），疑似卡死" >> "$alerts"
+    (( bad > 0 )) && echo "$name: 日志里有 $bad 处 Traceback/OOM/nan，看 $f" >> "$alerts"
+  fi
+
+  if [[ -s "$alerts" ]]; then
+    REASONS+="  [$name] $(tr '\n' ';' < "$alerts")"$'\n'
+    ALERT_RC=1
+  fi
+  rm -f "$alerts"
+}
+
+snapshot() {
+  REASONS=""; ALERT_RC=0
+  printf '===== %s =====\n' "$(date '+%F %T')"
+  for r in "${RUNS[@]}"; do
+    IFS='|' read -r name log yaml run_dir gpus total save_every <<<"$r"
+    snap_one "$name" "$log" "$yaml" "$run_dir" "$gpus" "$total" "$save_every"
+  done
+  if (( ALERT_RC )); then
+    printf '[ALERT]\n%s' "$REASONS"
+    { printf '== %s ==\n%s\n' "$(date '+%F %T')" "$REASONS"; } >> "$ALERT"
+    return 1
+  fi
+  printf '[OK] 两路都正常\n'
+  return 0
+}
+
+case "${1:-}" in
+  --loop)
+    iv=${2:-300}
+    echo "[watch] 每 ${iv}s 采样 -> $WATCH_LOG（告警 $ALERT）"
+    while :; do
+      out=$(snapshot 2>&1); rc=$?
+      { printf '%s\n\n' "$out"; } >> "$WATCH_LOG"
+      printf '%s\n' "$out"
+      sleep "$iv"
+    done
+    ;;
+  *) snapshot ;;
+esac

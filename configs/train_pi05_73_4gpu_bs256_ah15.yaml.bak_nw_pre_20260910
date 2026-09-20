@@ -1,0 +1,45 @@
+# 00073 / 4×PPU(GPU5-8) / PyTorch DDP。配方沿用 configs/train_pi05_73_16gpu_bs1024.yaml，
+# 只改：卡数 16→4、batch_size 1024→256（32/卡 → 64/卡）、action_horizon 50→15，并显式写死 prompt。
+# 路径是 openpi_train 容器内路径（/nvme1n1/openpi -> /workspace/openpi）。
+config_name: pi05_aloha
+framework: pytorch
+exp_name: pi05_73_4gpu_bs256_chunk15_20260910
+project_name: openpi
+checkpoint_base_dir: ./checkpoints
+assets_base_dir: ./assets
+batch_size: 256
+num_epochs: 100
+seed: 42
+num_workers: 4  # 2026-09-10 实测 nw=8 卡 8min 无步(节点 256 核被 00094 nw=16 + walloss 占满, sy 65%), 回退 4
+log_interval: 100
+save_every_epochs: 3  # 2026-09-10 重启：10→3 epoch（=2274 步）
+keep_period: 2274  # 2026-09-10：与 save_interval 同值，避免只留最新 ckpt
+overwrite: false
+resume: false
+wandb_enabled: false
+fsdp_devices: 4
+ema_decay: 0.99
+pytorch_training_precision: bfloat16
+pytorch_weight_path: /workspace/openpi/models/pi05_fixed
+model:
+  action_horizon: 15
+lr_schedule:
+  warmup_steps: 2000
+  peak_lr: 1.0e-4
+  decay_lr: 1.0e-5
+optimizer:
+  b1: 0.9
+  b2: 0.95
+  eps: 1.0e-8
+  weight_decay: 1.0e-10
+  clip_gradient_norm: 1.0
+data:
+  repo_id: /workspace/openpi/datasets/00073_20260818_RM_01_yj_21
+  assets:
+    assets_dir: /workspace/openpi/datasets/00073_20260818_RM_01_yj_21
+    asset_id: "."
+  default_prompt: "Using both hands, pick up the courier items from the green conveyor belt. Place the white courier bags into the left box and the brown courier boxes into the right box."
+  prompt_from_task: true
+  prompt_from_subtask: false
+  adapt_to_pi: false
+  delta_action_dims: [7, 7, -1, -1]

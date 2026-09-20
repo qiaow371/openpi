@@ -1,0 +1,47 @@
+# 00086 / 4×PPU(GPU 8,9,10,11) / 与 train_pi05_00086_4gpu_bs384_ah15.yaml 仅两处不同：
+#   ① action_horizon 15→100；② exp_name 显式命名 ah100（与在跑的 ah15 版形成对照实验）。
+# 数据集 300 ep ≈ 129k 帧 → 128887//384 ≈ 335 step/epoch，100 epoch 共 33500 步；
+# save_every 10 ep ≈ 3350 步；keep_period 5000 ≈ 15 epoch。
+# 宿主机执行：bash /nvme1n1/openpi/cigai_train/openpi-jiangsuan/scripts/start_train_00086_4gpu_ah100.sh
+config_name: pi05_aloha
+framework: pytorch
+exp_name: pi05_00086_4gpu_bs384_ah100_20260915
+project_name: openpi
+checkpoint_base_dir: ./checkpoints
+assets_base_dir: ./assets
+batch_size: 384
+num_epochs: 100
+seed: 42
+num_workers: 8
+log_interval: 100
+save_every_epochs: 1
+keep_period: 5000
+overwrite: false
+resume: false
+wandb_enabled: false
+fsdp_devices: 4
+ema_decay: 0.99
+pytorch_training_precision: bfloat16
+pytorch_weight_path: /workspace/openpi/models/pi05_fixed
+model:
+  action_horizon: 100
+lr_schedule:
+  warmup_steps: 1000
+  peak_lr: 2.5e-5
+  decay_lr: 2.5e-6
+optimizer:
+  b1: 0.9
+  b2: 0.95
+  eps: 1.0e-8
+  weight_decay: 1.0e-10
+  clip_gradient_norm: 1.0
+data:
+  repo_id: /workspace/openpi/datasets/00086_20260827_RM_01_YJ_ZL_21
+  assets:
+    assets_dir: /workspace/openpi/datasets/00086_20260827_RM_01_YJ_ZL_21
+    asset_id: "."
+  default_prompt: "Using both hands, pull open the drawer with the blue handle using your left hand, take out the white medicine box with your right hand, place it into the green drawer, and finally close the drawer."
+  prompt_from_task: true
+  prompt_from_subtask: false
+  adapt_to_pi: false
+  delta_action_dims: [7, 7, -1, -1]

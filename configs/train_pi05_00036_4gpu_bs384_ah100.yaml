@@ -1,0 +1,47 @@
+# 00036 / 8xPPU(GPU 0-7) (20260916 改造) / 参考 train_pi05_00036_4gpu_bs384_ah15.yaml，
+#   仅两处不同：① action_horizon 15→100；② exp_name 显式命名 ah100（与在跑的
+#   ah15 任务隔离 checkpoint 目录）。其余超参与 ah15 完全一致（bs384 / 100ep /
+#   sv10ep / nw8）。数据集 151 ep（最短 227 帧 > ah=100，窗口不越界）。
+# 宿主机执行：bash /nvme1n1/openpi/cigai_train/openpi-jiangsuan/scripts/start_train_00036_4gpu_ah100.sh
+config_name: pi05_aloha
+framework: pytorch
+exp_name: pi05_00036_4gpu_bs384_ah100_20260915
+project_name: openpi
+checkpoint_base_dir: ./checkpoints
+assets_base_dir: ./assets
+batch_size: 384
+num_epochs: 100
+seed: 42
+num_workers: 8
+log_interval: 100
+save_every_epochs: 1
+keep_period: 5000
+overwrite: false
+resume: false
+wandb_enabled: false
+fsdp_devices: 4
+ema_decay: 0.99
+pytorch_training_precision: bfloat16
+pytorch_weight_path: /workspace/openpi/models/pi05_fixed
+model:
+  action_horizon: 100
+lr_schedule:
+  warmup_steps: 1000
+  peak_lr: 2.5e-5
+  decay_lr: 2.5e-6
+optimizer:
+  b1: 0.9
+  b2: 0.95
+  eps: 1.0e-8
+  weight_decay: 1.0e-10
+  clip_gradient_norm: 1.0
+data:
+  repo_id: /workspace/openpi/datasets/00036_20260804_RM_01_yj_21
+  assets:
+    assets_dir: /workspace/openpi/datasets/00036_20260804_RM_01_yj_21
+    asset_id: "."
+  default_prompt: "With both hands, pick up the yellow banana and the yellow lemon and put them into the black box; then take the green vegetables and place them into the blue box."
+  prompt_from_task: true
+  prompt_from_subtask: false
+  adapt_to_pi: false
+  delta_action_dims: [7, 7, -1, -1]

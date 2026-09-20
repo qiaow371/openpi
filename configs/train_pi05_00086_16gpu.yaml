@@ -38,6 +38,6 @@ data:
     asset_id: "."
   default_prompt: "Using both hands, pull open the drawer with the blue handle using your left hand, take out the white medicine box with your right hand, place it into the green drawer, and finally close the drawer."
   prompt_from_task: true
-  prompt_from_subtask: true
+  prompt_from_subtask: false
   adapt_to_pi: false
   delta_action_dims: [7, 7, -1, -1]

@@ -39,6 +39,6 @@ data:
     asset_id: "."
   default_prompt: "Using both hands, pick up the courier items from the green conveyor belt. Place the white courier bags into the left box and the brown courier boxes into the right box."
   prompt_from_task: true
-  prompt_from_subtask: true
+  prompt_from_subtask: false
   adapt_to_pi: false
   delta_action_dims: [7, 7, -1, -1]

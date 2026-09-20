@@ -228,6 +228,29 @@ def create_torch_dataset(
                 "data.prompt_from_subtask=true but meta/episodes_detailed_task.jsonl missing; using global task only"
             )
 
+    if getattr(data_config, "subtask_ce", False):
+        root = pathlib.Path(dataset_meta.root) / "meta"
+        spans_file = None
+        for name in ("episodes_detailed_task.jsonl", "subtask_spans.jsonl"):
+            cand = root / name
+            if cand.is_file():
+                spans_file = cand
+                break
+        if spans_file is not None:
+            cov = inspect_subtask_sidecar(str(dataset_meta.root))
+            logging.info(
+                "Attaching subtask CE labels from %s (%s/%s episodes, %s spans); action prompt stays task",
+                spans_file,
+                cov["annotated_episodes"],
+                cov["total_episodes"],
+                cov["spans"],
+            )
+            dataset = TransformedDataset(dataset, [_transforms.AttachSubtaskFromSpans.from_jsonl(spans_file)])
+        else:
+            logging.warning(
+                "data.subtask_ce=true but meta/episodes_detailed_task.jsonl missing; CE labels will be empty"
+            )
+
     return dataset
 
 
@@ -578,11 +601,24 @@ class TorchDataLoader:
                     yield jax.tree.map(torch.as_tensor, batch)
 
 
+def _drop_non_numeric(tree):
+    """torch.as_tensor cannot take numpy.str_ / object leaves (e.g. leftover subtask text)."""
+    if isinstance(tree, dict):
+        out = {}
+        for key, value in tree.items():
+            if isinstance(value, np.ndarray) and value.dtype.kind in ("U", "S", "O"):
+                continue
+            out[key] = _drop_non_numeric(value)
+        return out
+    return tree
+
+
 def _collate_fn(items):
     """Collate the batch elements into batched numpy arrays."""
     # Make sure to convert to numpy arrays before stacking since some of the incoming elements
     # may be JAX arrays.
-    return jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+    batched = jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+    return _drop_non_numeric(batched)
 
 
 def _worker_init_fn(worker_id: int) -> None:
@@ -591,6 +627,25 @@ def _worker_init_fn(worker_id: int) -> None:
     # means that this approach will not work for selecting the backend.
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+    # 20260916: 多路并发下 worker 内 OpenMP/BLAS/cv2 线程池默认按核数扩容，
+    # 每 worker 瞬时 6+ 线程 -> 128 worker x 6 = 768 线程超订 256 核，sy 风暴拖垮解码吞吐。
+    # 此处把每个 worker 限制为单线程计算（解码 IO 等待本就不吃 CPU）。
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENCV_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    try:
+        import torch
+
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+    try:
+        import cv2
+
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
 
 
 class RLDSDataLoader:

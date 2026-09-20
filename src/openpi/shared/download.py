@@ -12,7 +12,10 @@ import urllib.parse
 import filelock
 import fsspec
 import fsspec.generic
-import tqdm_loggable.auto as tqdm
+try:
+    import tqdm_loggable.auto as tqdm
+except ModuleNotFoundError:
+    import tqdm.auto as tqdm
 
 # Environment variable to control cache directory path, ~/.cache/openpi will be used by default.
 _OPENPI_DATA_HOME = "OPENPI_DATA_HOME"
@@ -166,7 +169,8 @@ def _ensure_permissions(path: pathlib.Path) -> None:
 
 def _get_mtime(year: int, month: int, day: int) -> float:
     """Get the mtime of a given date at midnight UTC."""
-    date = datetime.datetime(year, month, day, tzinfo=datetime.UTC)
+    utc = getattr(datetime, "UTC", datetime.timezone.utc)
+    date = datetime.datetime(year, month, day, tzinfo=utc)
     return time.mktime(date.timetuple())
 
 
