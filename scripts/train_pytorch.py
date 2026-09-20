@@ -323,6 +323,248 @@ def log_memory_usage(device, step, phase="unknown"):
     )
 
 
+# ---------------------------------------------------------------------------
+# per-joint × per-timestep loss 探针（2026-09-14 华为 π0.5 事故复盘）
+# ---------------------------------------------------------------------------
+# 标量 loss = mean([B, H, D]) 会掩盖所有结构性问题。这里保留 [H, D] 矩阵落盘。
+# 判据：D=32 中后 16 维是 pad 0，其目标 u = ε，而 x_t = t·ε 使 ε 完全可知，
+# 所以预训练好的 π0.5 pad 维 loss 已接近 0 —— pad_mean ≈ 1 等价于"动作专家是冷的"。
+_PROBE_REAL_DIM = 16
+_PROBE_PAD_MEAN_COLD = 0.5
+
+
+def _loss_probe_stats(mat) -> dict:
+    """[H, D] numpy 矩阵 → 可直接喂 LLM 的摘要 dict。"""
+    real = mat[:, :_PROBE_REAL_DIM]
+    pad = mat[:, _PROBE_REAL_DIM:]
+    dim = real.mean(axis=0)
+    return {
+        "dim_real": [round(float(v), 5) for v in dim],
+        "per_step": [round(float(v), 5) for v in mat.mean(axis=1)],
+        "matrix": [[round(float(v), 5) for v in row] for row in mat],
+        "real_mean": round(float(real.mean()), 5),
+        "pad_mean": round(float(pad.mean()), 5),
+        "worst_dim": int(dim.argmax()),
+        "best_dim": int(dim.argmin()),
+        "verdict": "cold-expert" if float(pad.mean()) > _PROBE_PAD_MEAN_COLD else "warm",
+    }
+
+
+def _write_loss_probe(checkpoint_dir: str, step, mat) -> None:
+    """把 [H, D] 均值矩阵追加成一行 JSON。任何异常都只 warning —— 探针不许弄死训练。"""
+    try:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        path = os.path.join(checkpoint_dir, "loss_probe.jsonl")
+        rec = {"step": int(step)}
+        rec.update(_loss_probe_stats(mat))
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+        logging.info(
+            "PROBE step=%s real=%.4f pad=%.4f worst=d%d(%.3f) best=d%d(%.3f) verdict=%s",
+            step,
+            rec["real_mean"],
+            rec["pad_mean"],
+            rec["worst_dim"],
+            rec["dim_real"][rec["worst_dim"]],
+            rec["best_dim"],
+            rec["dim_real"][rec["best_dim"]],
+            rec["verdict"],
+        )
+    except Exception as e:  # noqa: BLE001 - 探针失败不能影响训练
+        logging.warning("loss probe 写入失败（忽略）：%s", e)
+
+
+class ActionDimAbort(RuntimeError):
+    """逐维 loss 门禁触发。训练循环应让它冒泡退出，不要吞掉。"""
+
+
+DIM_NAMES = [f"L{j}" for j in range(1, 8)] + [f"R{j}" for j in range(1, 8)] + ["Lgrip", "Rgrip"]
+REAL_DIM = 16
+GUARD_UNTIL_STEP = 100
+# 健康 run 起训单维 <1.4、max/median ≤3.1；有毒 00036 起训单维 12~15、比值 35~40。
+ABS_ABORT = 5.0
+RATIO_ABORT = 8.0
+RATIO_MIN_MEDIAN = 0.05
+PAD_ABORT = 0.1
+SCALAR_ABORT = 1.0
+
+
+def _evaluate_action_dims(mat, step=0, scalar_loss=None) -> dict:
+    """[H, D] 矩阵 → {abort, codes, reasons, ...}。不抛错。"""
+    arr = np.asarray(mat, dtype=np.float64)
+    step = int(step)
+    codes: list[str] = []
+    reasons: list[str] = []
+
+    if arr.ndim != 2 or arr.size == 0:
+        codes.append("bad_shape")
+        reasons.append(f"探针矩阵形状异常：{getattr(arr, 'shape', None)}")
+        return {
+            "abort": True,
+            "step": step,
+            "codes": codes,
+            "reasons": reasons,
+            "dim_real": [],
+            "pad_mean": None,
+            "real_mean": None,
+            "scalar_loss": None if scalar_loss is None else float(scalar_loss),
+            "worst_dim": None,
+            "worst_name": None,
+            "worst_val": None,
+            "median": None,
+            "ratio": None,
+            "window": step <= GUARD_UNTIL_STEP,
+        }
+
+    if not np.isfinite(arr).all():
+        codes.append("nan")
+        reasons.append("逐维 loss 出现 NaN/Inf")
+
+    n_real = min(REAL_DIM, arr.shape[1])
+    real = arr[:, :n_real]
+    dim = real.mean(axis=0)
+    pad = arr[:, n_real:] if arr.shape[1] > n_real else None
+    pad_mean = float(pad.mean()) if pad is not None and pad.size else None
+    real_mean = float(real.mean())
+    worst = int(dim.argmax()) if dim.size else 0
+    worst_val = float(dim[worst]) if dim.size else None
+    median = float(np.median(dim)) if dim.size else None
+    ratio = (
+        float(worst_val / median)
+        if worst_val is not None and median is not None and median >= RATIO_MIN_MEDIAN
+        else None
+    )
+    name = DIM_NAMES[worst] if worst < len(DIM_NAMES) else f"d{worst}"
+    scalar = None if scalar_loss is None else float(scalar_loss)
+
+    if worst_val is not None and worst_val >= ABS_ABORT:
+        codes.append("dim_abs")
+        reasons.append(
+            f"{name}(d{worst})={worst_val:.3f} ≥ {ABS_ABORT}，单维爆炸"
+            "（stats/掩码拆开的典型形状，标量会被 pad 摊掉）"
+        )
+
+    in_window = step <= GUARD_UNTIL_STEP
+    if in_window and ratio is not None and ratio >= RATIO_ABORT:
+        codes.append("dim_ratio")
+        reasons.append(
+            f"前 {GUARD_UNTIL_STEP} 步 {name}/median = {ratio:.1f} ≥ {RATIO_ABORT}"
+            f"（median={median:.3f}）"
+        )
+
+    if pad_mean is not None and pad_mean >= PAD_ABORT:
+        codes.append("pad_cold")
+        reasons.append(
+            f"pad_mean={pad_mean:.4f} ≥ {PAD_ABORT}，动作专家冷启动（热基座应接近 0）"
+        )
+
+    if scalar is not None and scalar >= SCALAR_ABORT:
+        codes.append("scalar_cold")
+        reasons.append(f"标量 loss={scalar:.4f} ≥ {SCALAR_ABORT}，坏基座哨兵")
+
+    dim_real = [round(float(v), 5) for v in dim]
+    return {
+        "abort": bool(codes),
+        "step": step,
+        "codes": codes,
+        "reasons": reasons,
+        "dim_real": dim_real,
+        "dim_names": DIM_NAMES[:n_real],
+        "pad_mean": None if pad_mean is None else round(pad_mean, 5),
+        "real_mean": round(real_mean, 5),
+        "scalar_loss": None if scalar is None else round(scalar, 5),
+        "worst_dim": worst,
+        "worst_name": name,
+        "worst_val": None if worst_val is None else round(worst_val, 5),
+        "median": None if median is None else round(median, 5),
+        "ratio": None if ratio is None else round(ratio, 3),
+        "window": in_window,
+        "thresholds": {
+            "abs": ABS_ABORT,
+            "ratio": RATIO_ABORT,
+            "until_step": GUARD_UNTIL_STEP,
+            "pad": PAD_ABORT,
+            "scalar": SCALAR_ABORT,
+        },
+    }
+
+
+def _format_action_dim_abort_md(result: dict) -> str:
+    names = result.get("dim_names") or DIM_NAMES
+    dims = result.get("dim_real") or []
+    lines = [
+        "# π0.5 action-dim 门禁：训练已停止",
+        "",
+        f"- step: {result.get('step')}",
+        f"- codes: {', '.join(result.get('codes') or []) or '（无）'}",
+        f"- worst: {result.get('worst_name')}(d{result.get('worst_dim')})={result.get('worst_val')}",
+        f"- max/median: {result.get('ratio')}  (median={result.get('median')})",
+        f"- real_mean: {result.get('real_mean')}  pad_mean: {result.get('pad_mean')}",
+        f"- scalar_loss: {result.get('scalar_loss')}",
+        "",
+        "## 原因",
+        "",
+    ]
+    for r in result.get("reasons") or []:
+        lines.append(f"- {r}")
+    lines += ["", "## 前 16 维 FM-MSE（batch×chunk 均值）", "", "| dim | name | loss |", "|---:|---|---:|"]
+    for i, v in enumerate(dims):
+        n = names[i] if i < len(names) else f"d{i}"
+        mark = "  ← worst" if i == result.get("worst_dim") else ""
+        lines.append(f"| {i} | {n} | {v}{mark} |")
+    lines += [
+        "",
+        "提醒通道这次没接。看本文件和同目录 `action_dim_abort.json` / `loss_probe.jsonl`。",
+        "常见根因：`norm_stats` 与 `delta_action_dims` 掩码不一致，或动作专家没热加载。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _write_action_dim_abort_report(checkpoint_dir: str, result: dict) -> str:
+    """写 json + md，返回 md 路径。"""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    base = os.path.join(checkpoint_dir, "action_dim_abort")
+    json_path = base + ".json"
+    md_path = base + ".md"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(_format_action_dim_abort_md(result))
+    return md_path
+
+
+def _guard_action_dims(checkpoint_dir, step, mat, scalar_loss, is_main, device) -> None:
+    """前 100 步盯全部 action dim；异常写 report 并停训。PI05_ACTION_DIM_GUARD=0 可关。"""
+    if os.environ.get("PI05_ACTION_DIM_GUARD", "1").strip().lower() in ("0", "false", "off", "no"):
+        return
+    result = _evaluate_action_dims(mat, step=int(step), scalar_loss=scalar_loss)
+    abort = bool(result["abort"])
+    try:
+        if dist.is_available() and dist.is_initialized():
+            flag = torch.tensor([1 if abort else 0], device=device, dtype=torch.int32)
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+            abort = bool(int(flag.item()))
+    except Exception:  # noqa: BLE001 - 集合失败时仍用本 rank 的判断
+        pass
+    if not abort:
+        return
+    if is_main:
+        try:
+            md = _write_action_dim_abort_report(checkpoint_dir, result)
+            logging.error("ACTION-DIM ABORT report=%s", md)
+        except Exception as e:  # noqa: BLE001
+            logging.error("ACTION-DIM ABORT 写 report 失败：%s", e)
+        try:
+            _write_loss_probe(checkpoint_dir, step, mat)
+        except Exception:  # noqa: BLE001
+            pass
+    msg = "; ".join(result.get("reasons") or ["action-dim guard abort"])
+    logging.error("ACTION-DIM ABORT step=%s %s", step, msg)
+    raise ActionDimAbort(f"step={step} {msg}  (report: {checkpoint_dir}/action_dim_abort.md)")
+
+
 def load_pytorch_weight_path(model, weight_path: str, device: str | None = None) -> None:
     """Load ``model.safetensors`` from a π0.5 weight dir.
 
@@ -738,6 +980,21 @@ def train_loop(config: _config.TrainConfig):
 
             loss = losses.mean()
 
+            # per-joint × per-timestep 探针：不进反传，只取 batch 均值
+            fm_probe = None
+            if isinstance(losses, torch.Tensor) and losses.dim() == 3:
+                with torch.no_grad():
+                    fm_probe = losses.detach().float().mean(dim=0).cpu().numpy()  # [H, D]
+            if fm_probe is not None:
+                _guard_action_dims(
+                    checkpoint_dir=config.checkpoint_dir,
+                    step=global_step,
+                    mat=fm_probe,
+                    scalar_loss=float(loss.detach()),
+                    is_main=is_main,
+                    device=device,
+                )
+
             # Backward pass
             loss.backward()
 
@@ -761,13 +1018,14 @@ def train_loop(config: _config.TrainConfig):
 
             # Collect stats
             if is_main:
-                infos.append(
-                    {
-                        "loss": loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                    }
-                )
+                info = {
+                    "loss": loss.item(),
+                    "learning_rate": optim.param_groups[0]["lr"],
+                    "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                }
+                if fm_probe is not None:
+                    info["fm_probe"] = fm_probe
+                infos.append(info)
 
             if is_main and (global_step % config.log_interval == 0) and infos:
                 elapsed = time.time() - start_time
@@ -800,6 +1058,9 @@ def train_loop(config: _config.TrainConfig):
                     else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
                 )
 
+                probe_mats = [i["fm_probe"] for i in infos if "fm_probe" in i]
+                if probe_mats:
+                    _write_loss_probe(config.checkpoint_dir, global_step, sum(probe_mats) / len(probe_mats))
                 while loss_steps and loss_steps[-1] >= int(global_step):
                     loss_steps.pop()
                     loss_values.pop()
