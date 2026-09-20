@@ -492,48 +492,173 @@ def _read_cpu_mem() -> dict[str, Any]:
     }
 
 
-def _read_gpu_usage() -> list[dict[str, Any]]:
-    query = (
-        "index,name,utilization.gpu,utilization.memory,"
-        "memory.used,memory.total,temperature.gpu,power.draw"
-    )
+def _smi_path() -> str:
+    extra = "/usr/local/PPU_SDK/ppu-smi/bin"
+    path = os.environ.get("PATH", "")
+    if extra not in path:
+        os.environ["PATH"] = extra + ":" + path
+    return os.environ["PATH"]
+
+
+def _run_smi(cmd: list[str], timeout: float = 8.0) -> str:
     try:
         result = subprocess.run(
-            [
-                "nvidia-smi",
-                f"--query-gpu={query}",
-                "--format=csv,noheader,nounits",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
+            cmd, check=False, capture_output=True, text=True, timeout=timeout
         )
-    except Exception as exc:
-        return [{"error": f"nvidia-smi unavailable: {exc}"}]
+    except Exception:
+        return ""
+    return result.stdout or ""
 
-    if result.returncode != 0:
-        err = (result.stderr or result.stdout or "").strip()
-        return [{"error": err or f"nvidia-smi exit {result.returncode}"}]
 
+def _visible_ids() -> set[int] | None:
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES") or os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or ""
+    ids = [int(p) for p in raw.split(",") if p.strip().isdigit()]
+    return set(ids) or None
+
+
+def _parse_smi_csv(raw: str, name: str) -> list[dict[str, Any]]:
+    want = _visible_ids()
     gpus: list[dict[str, Any]] = []
-    for line in result.stdout.strip().splitlines():
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 8:
+    for line in raw.splitlines():
+        line = line.strip().replace("\r", "")
+        if not line or not line[:1].isdigit():
             continue
+        parts = [p.strip().replace("%", "").replace("MiB", "") for p in line.split(",")]
+        if len(parts) < 4:
+            continue
+        try:
+            idx = int(float(parts[0]))
+        except ValueError:
+            continue
+        if want is not None and idx not in want:
+            continue
+        used = _maybe_float(parts[2])
+        total = _maybe_float(parts[3])
+        mem_pct = None
+        if isinstance(used, (int, float)) and isinstance(total, (int, float)) and total:
+            mem_pct = round(100.0 * float(used) / float(total), 2)
         gpus.append(
             {
-                "index": int(parts[0]) if parts[0].isdigit() else parts[0],
-                "name": parts[1],
-                "utilization_gpu_pct": _maybe_float(parts[2]),
-                "utilization_memory_pct": _maybe_float(parts[3]),
-                "memory_used_mb": _maybe_float(parts[4]),
-                "memory_total_mb": _maybe_float(parts[5]),
-                "temperature_c": _maybe_float(parts[6]),
-                "power_draw_w": _maybe_float(parts[7]),
+                "index": idx,
+                "name": name,
+                "utilization_gpu_pct": _maybe_float(parts[1]),
+                "utilization_memory_pct": mem_pct,
+                "memory_used_mb": used,
+                "memory_total_mb": total,
+                "temperature_c": _maybe_float(parts[4]) if len(parts) > 4 else None,
+                "power_draw_w": _maybe_float(parts[5]) if len(parts) > 5 else None,
             }
         )
     return gpus
+
+
+def _read_npu_usage(raw: str) -> list[dict[str, Any]]:
+    """Parse `npu-smi info`. Phy-ID matches torch_npu device id."""
+    import re
+
+    want = _visible_ids()
+    out: dict[int, dict[str, Any]] = {}
+    pend: dict[str, Any] = {}
+    for line in raw.splitlines():
+        c = [x.strip() for x in line.split("|")]
+        if len(c) < 4 or not re.match(r"^\d+\b", c[1]):
+            continue
+        nums = re.findall(r"\d+", c[1])
+        if ":" in c[2]:
+            rec = dict(pend)
+            body = " ".join(c[3:])
+            mt = re.match(r"(\d+)\b", body)
+            if mt:
+                rec["util"] = _maybe_float(mt.group(1))
+            mem = None
+            for a, b in re.findall(r"(\d+)\s*/\s*(\d+)", body):
+                if int(b) > 0:
+                    mem = (float(a), float(b))
+            if mem:
+                rec["mem_used"], rec["mem_total"] = mem
+            cid = int(nums[1] if len(nums) > 1 else nums[0])
+            out.setdefault(cid, {"index": cid}).update(rec)
+            pend = {}
+            continue
+        body = c[3] if c[2] in ("OK", "Warning", "Critical") else c[2]
+        hw = re.match(r"([\d.]+|-)\s+(\d+)\b", body)
+        pend = {}
+        if hw:
+            if hw.group(1) != "-":
+                pend["power"] = _maybe_float(hw.group(1))
+            pend["temp"] = _maybe_float(hw.group(2))
+    gpus: list[dict[str, Any]] = []
+    for cid in sorted(out):
+        if want is not None and cid not in want:
+            continue
+        rec = out[cid]
+        used, total = rec.get("mem_used"), rec.get("mem_total")
+        mem_pct = None
+        if isinstance(used, (int, float)) and isinstance(total, (int, float)) and total:
+            mem_pct = round(100.0 * float(used) / float(total), 2)
+        gpus.append(
+            {
+                "index": cid,
+                "name": "Ascend",
+                "utilization_gpu_pct": rec.get("util"),
+                "utilization_memory_pct": mem_pct,
+                "memory_used_mb": used,
+                "memory_total_mb": total,
+                "temperature_c": rec.get("temp"),
+                "power_draw_w": rec.get("power"),
+            }
+        )
+    return gpus
+
+
+def _read_gpu_usage() -> list[dict[str, Any]]:
+    """PPU (江算) first, then NVIDIA, then Ascend npu-smi. 江算 nvidia-smi 是兼容壳。"""
+    _smi_path()
+    if shutil.which("ppu-smi"):
+        raw = _run_smi([
+            "ppu-smi",
+            "--query-ppu=index,utilization.ppu,memory.used,memory.total,temperature.ppu,power.draw",
+            "--format=csv,noheader,nounits",
+        ])
+        cards = _parse_smi_csv(raw, "PPU")
+        if cards:
+            return cards
+    if shutil.which("nvidia-smi"):
+        query = (
+            "index,name,utilization.gpu,utilization.memory,"
+            "memory.used,memory.total,temperature.gpu,power.draw"
+        )
+        raw = _run_smi(["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"])
+        gpus: list[dict[str, Any]] = []
+        want = _visible_ids()
+        for line in raw.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 8:
+                continue
+            idx = int(parts[0]) if parts[0].isdigit() else parts[0]
+            if isinstance(idx, int) and want is not None and idx not in want:
+                continue
+            gpus.append(
+                {
+                    "index": idx,
+                    "name": parts[1],
+                    "utilization_gpu_pct": _maybe_float(parts[2]),
+                    "utilization_memory_pct": _maybe_float(parts[3]),
+                    "memory_used_mb": _maybe_float(parts[4]),
+                    "memory_total_mb": _maybe_float(parts[5]),
+                    "temperature_c": _maybe_float(parts[6]),
+                    "power_draw_w": _maybe_float(parts[7]),
+                }
+            )
+        if gpus:
+            return gpus
+        return [{"error": "nvidia-smi returned no rows"}]
+    if shutil.which("npu-smi"):
+        cards = _read_npu_usage(_run_smi(["npu-smi", "info"], timeout=20.0))
+        if cards:
+            return cards
+        return [{"error": "npu-smi info parsed no cards"}]
+    return [{"error": "no ppu-smi/nvidia-smi/npu-smi"}]
 
 
 def _maybe_float(value: str) -> float | str | None:
@@ -544,12 +669,28 @@ def _maybe_float(value: str) -> float | str | None:
 
 
 def collect_cpu_gpu_usage() -> dict[str, Any]:
+    gpus = _read_gpu_usage()
+    name = ""
+    for g in gpus:
+        if "name" in g:
+            name = str(g.get("name") or "")
+            break
+    if name.startswith("PPU"):
+        backend = "ppu"
+    elif name == "Ascend":
+        backend = "npu"
+    elif gpus and "error" not in gpus[0]:
+        backend = "nvidia"
+    else:
+        backend = "none"
     return {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "hostname": platform.node(),
+        "accel_backend": backend,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "ascend_visible_devices": os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
         "cpu": _read_cpu_mem(),
-        "gpu": _read_gpu_usage(),
+        "gpu": gpus,
     }
 
 
@@ -592,6 +733,7 @@ class ResourceMonitor:
             "interval_s": self.interval_s,
             "hostname": platform.node(),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "ascend_visible_devices": os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
         }
         write_json(self.monitor_dir / "meta.json", meta)
         save_cpu_gpu_usage(self.output_dir)
@@ -668,6 +810,43 @@ class ResourceMonitor:
         if rows:
             with (self.monitor_dir / "gpu_util.csv").open("a", encoding="utf-8") as f:
                 f.writelines(rows)
+
+        cards = []
+        utils = []
+        fracs = []
+        for gpu in snap.get("gpu") or []:
+            if "error" in gpu:
+                continue
+            used, total = gpu.get("memory_used_mb"), gpu.get("memory_total_mb")
+            util = gpu.get("utilization_gpu_pct")
+            rec = {
+                "id": gpu.get("index"),
+                "util": util,
+                "mem_used_mib": used,
+                "mem_total_mib": total,
+                "temp_c": gpu.get("temperature_c"),
+                "power_w": gpu.get("power_draw_w"),
+            }
+            cards.append(rec)
+            if isinstance(util, (int, float)):
+                utils.append(float(util))
+            if isinstance(used, (int, float)) and isinstance(total, (int, float)) and total:
+                fracs.append(float(used) / float(total))
+        hw = {
+            "ts": ts,
+            "backend": snap.get("accel_backend"),
+            "devices": snap.get("cuda_visible_devices") or snap.get("ascend_visible_devices"),
+            "cards": cards,
+            "n_cards": len(cards),
+            "util_avg": round(sum(utils) / len(utils), 2) if utils else None,
+            "mem_frac_avg": round(sum(fracs) / len(fracs), 4) if fracs else None,
+            "host": {"load1": load.get("1m"), "mem_pct": mem.get("used_pct")},
+        }
+        try:
+            with (self.output_dir / "hw.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps(hw, ensure_ascii=False) + "\n")
+        except Exception:
+            logging.exception("Failed to append hw.jsonl")
 
         write_json(self.output_dir / CPU_GPU_USAGE_NAME, snap)
 
