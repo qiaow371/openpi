@@ -1,7 +1,8 @@
-# jiangsuan-16 16×PPU PyTorch FSDP。路径是 openpi_train 容器内路径。
+# 00036 16×PPU：输入仍是 task prompt；VLM 对 sidecar subtask 做 CE；Action FM 用标注动作。
+# prompt_from_subtask=false（不再把 subtask 当动作条件）。
 config_name: pi05_aloha
 framework: pytorch
-exp_name: auto
+exp_name: pi05_00036_task_ce_fm_16gpu_20260907
 project_name: openpi
 checkpoint_base_dir: ./checkpoints
 assets_base_dir: ./assets
@@ -9,7 +10,7 @@ batch_size: 1024
 num_epochs: 100
 seed: 42
 num_workers: 4
-log_interval: 100
+log_interval: 50
 save_every_epochs: 10
 keep_period: 5000
 overwrite: false
@@ -19,8 +20,12 @@ fsdp_devices: 16
 ema_decay: 0.99
 pytorch_training_precision: bfloat16
 pytorch_weight_path: /workspace/openpi/models/pi05_fixed
+trainable_modules: all
 model:
+  pi05: true
   action_horizon: 50
+  paligemma_variant: gemma_2b
+  action_expert_variant: gemma_300m
 lr_schedule:
   warmup_steps: 2000
   peak_lr: 1.0e-4
@@ -32,12 +37,15 @@ optimizer:
   weight_decay: 1.0e-10
   clip_gradient_norm: 1.0
 data:
-  repo_id: /workspace/openpi/datasets/00086_20260827_RM_01_YJ_ZL_21
+  repo_id: /workspace/openpi/datasets/00036_20260804_RM_01_yj_21
   assets:
-    assets_dir: /workspace/openpi/datasets/00086_20260827_RM_01_YJ_ZL_21
+    assets_dir: /workspace/openpi/datasets/00036_20260804_RM_01_yj_21
     asset_id: "."
-  default_prompt: "Using both hands, pull open the drawer with the blue handle using your left hand, take out the white medicine box with your right hand, place it into the green drawer, and finally close the drawer."
+  default_prompt: "With both hands, pick up the yellow banana and the yellow lemon and put them into the black box; then take the green vegetables and place them into the blue box."
   prompt_from_task: true
   prompt_from_subtask: false
+  subtask_ce: true
+  subtask_ce_weight: 1.0
+  subtask_ce_microbatch: 8
   adapt_to_pi: false
   delta_action_dims: [7, 7, -1, -1]

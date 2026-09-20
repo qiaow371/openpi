@@ -28,6 +28,8 @@ import gc
 import logging
 import os
 import platform
+import json
+import struct
 import shutil
 import time
 
@@ -96,8 +98,9 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
 def setup_ddp():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
+    _npu = hasattr(torch, "npu") and torch.npu.is_available()
     if use_ddp and not torch.distributed.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        _npu = hasattr(torch, "npu") and torch.npu.is_available(); backend = "hccl" if _npu else ("nccl" if torch.cuda.is_available() else "gloo")
         torch.distributed.init_process_group(backend=backend, init_method="env://")
 
         # Set up debugging environment variables for DDP issues
@@ -105,7 +108,7 @@ def setup_ddp():
             os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
 
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    _dtype = "npu" if _npu else ("cuda" if torch.cuda.is_available() else "cpu"); device = torch.device(f"{_dtype}:{local_rank}")
     if torch.cuda.is_available():
         torch.cuda.set_device(device)
     return use_ddp, local_rank, device
@@ -323,6 +326,103 @@ def log_memory_usage(device, step, phase="unknown"):
     )
 
 
+# ---------------------------------------------------------------------------
+# 基座权重完整性硬校验（2026-09-14 华为 16 NPU π0.5 事故复盘）
+# ---------------------------------------------------------------------------
+# warm start 用 strict=False 是必要的：本地 vendor 的 PaliGemma 把 tied 权重挂在
+# ``paligemma.model.language_model.embed_tokens.weight``，HF 的 PaliGemma 不注册该 key。
+# 但 strict=False 也会把「传错 / 只传了一半」的基座静默吞掉：只含 PaliGemma 的
+# ``pi05_fixed_paligemma/model.safetensors``（604 张量）相对完整 π0.5（813 张量）缺 209 个
+# gemma_expert / action_in_proj / action_out_proj / time_mlp_* 张量 —— 动作专家随机初始化，
+# 训练照样跑、train loss 照样降到 1e-3，只有真机评估才发现（华为效果差的根因）。
+# 因此把容错收紧：缺失 key 只允许白名单，且基座必须真的含动作专家。
+
+_BASE_MISSING_ALLOWLIST = ("language_model.embed_tokens.weight",)
+_BASE_REQUIRED_PREFIXES = (
+    "paligemma_with_expert.gemma_expert.",  # 动作专家主干
+    "action_in_proj.",  # 动作/状态输入投影
+    "action_out_proj.",  # 动作输出头
+)
+
+
+def _safetensors_keys(path: str) -> list[str]:
+    """只读 safetensors 头部取 key 列表，不加载张量数据（头部一般几十 KB）。"""
+    with open(path, "rb") as f:
+        (head_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(head_len))
+    return [k for k in header if k != "__metadata__"]
+
+
+def _assert_base_complete(model_path: str, missing: list[str] | None = None) -> None:
+    """校验基座确实含动作专家与动作投影，且 missing 只在白名单内，否则抛错中止训练。"""
+    keys = _safetensors_keys(model_path)
+    absent = [prefix for prefix in _BASE_REQUIRED_PREFIXES if not any(k.startswith(prefix) for k in keys)]
+    if absent:
+        raise RuntimeError(
+            f"基座权重不完整：{model_path} 只有 {len(keys)} 个张量，完全不含 {absent}。"
+            " 多半是误用了只含 PaliGemma 的半成品（如 pi05_fixed_paligemma），"
+            " 继续训练会让动作专家随机初始化。请改用完整基座 pi05_fixed/。"
+        )
+    unknown = [k for k in (missing or []) if not any(allowed in k for allowed in _BASE_MISSING_ALLOWLIST)]
+    if unknown:
+        raise RuntimeError(
+            f"基座权重缺少 {len(unknown)} 个非白名单张量（示例：{unknown[:5]}），"
+            " 中止训练以免半随机初始化。"
+        )
+    logging.info("Base weight check OK: %s tensors, missing=%s (allowlist only)", len(keys), len(missing or []))
+
+
+# ---------------------------------------------------------------------------
+# per-joint × per-timestep loss 探针（2026-09-14 华为 π0.5 事故复盘）
+# ---------------------------------------------------------------------------
+# 标量 loss = mean([B, H, D]) 会掩盖所有结构性问题。这里保留 [H, D] 矩阵落盘。
+# 判据：D=32 中后 16 维是 pad 0，其目标 u = ε，而 x_t = t·ε 使 ε 完全可知，
+# 所以预训练好的 π0.5 pad 维 loss 已接近 0 —— pad_mean ≈ 1 等价于"动作专家是冷的"。
+_PROBE_REAL_DIM = 16
+_PROBE_PAD_MEAN_COLD = 0.5
+
+
+def _loss_probe_stats(mat) -> dict:
+    """[H, D] numpy 矩阵 → 可直接喂 LLM 的摘要 dict。"""
+    real = mat[:, :_PROBE_REAL_DIM]
+    pad = mat[:, _PROBE_REAL_DIM:]
+    dim = real.mean(axis=0)
+    return {
+        "dim_real": [round(float(v), 5) for v in dim],
+        "per_step": [round(float(v), 5) for v in mat.mean(axis=1)],
+        "matrix": [[round(float(v), 5) for v in row] for row in mat],
+        "real_mean": round(float(real.mean()), 5),
+        "pad_mean": round(float(pad.mean()), 5),
+        "worst_dim": int(dim.argmax()),
+        "best_dim": int(dim.argmin()),
+        "verdict": "cold-expert" if float(pad.mean()) > _PROBE_PAD_MEAN_COLD else "warm",
+    }
+
+
+def _write_loss_probe(checkpoint_dir: str, step, mat) -> None:
+    """把 [H, D] 均值矩阵追加成一行 JSON。任何异常都只 warning —— 探针不许弄死训练。"""
+    try:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        path = os.path.join(checkpoint_dir, "loss_probe.jsonl")
+        rec = {"step": int(step)}
+        rec.update(_loss_probe_stats(mat))
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+        logging.info(
+            "PROBE step=%s real=%.4f pad=%.4f worst=d%d(%.3f) best=d%d(%.3f) verdict=%s",
+            step,
+            rec["real_mean"],
+            rec["pad_mean"],
+            rec["worst_dim"],
+            rec["dim_real"][rec["worst_dim"]],
+            rec["best_dim"],
+            rec["dim_real"][rec["best_dim"]],
+            rec["verdict"],
+        )
+    except Exception as e:  # noqa: BLE001 - 探针失败不能影响训练
+        logging.warning("loss probe 写入失败（忽略）：%s", e)
+
+
 def load_pytorch_weight_path(model, weight_path: str, device: str | None = None) -> None:
     """Load ``model.safetensors`` from a π0.5 weight dir.
 
@@ -331,6 +431,7 @@ def load_pytorch_weight_path(model, weight_path: str, device: str | None = None)
     """
     raw = _unwrap_model(model)
     model_path = os.path.join(weight_path, "model.safetensors")
+    _assert_base_complete(model_path)
     try:
         if device is not None:
             missing, unexpected = safetensors.torch.load_model(raw, model_path, strict=False, device=device)
@@ -343,6 +444,7 @@ def load_pytorch_weight_path(model, weight_path: str, device: str | None = None)
         )
         if missing:
             logging.warning("Missing weight keys (first 12): %s", list(missing)[:12])
+        _assert_base_complete(model_path, missing)
         if unexpected:
             logging.info("Unexpected weight keys (first 8): %s", list(unexpected)[:8])
         return
@@ -575,6 +677,16 @@ def train_loop(config: _config.TrainConfig):
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    object.__setattr__(
+        model,
+        "subtask_ce_weight",
+        float(getattr(config.data, "subtask_ce_weight", 1.0) or 1.0),
+    )
+    object.__setattr__(
+        model,
+        "subtask_ce_microbatch",
+        int(getattr(config.data, "subtask_ce_microbatch", 8) or 8),
+    )
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -600,10 +712,10 @@ def train_loop(config: _config.TrainConfig):
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
-            device_ids=[device.index] if device.type == "cuda" else None,
+            device_ids=[device.index] if device.type in ("cuda", "npu") else None,
             find_unused_parameters=True,  # Disable for memory efficiency
             gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
+            static_graph=world_size >= 8 and not bool(getattr(config.data, "subtask_ce", False)),
         )
 
     # Load weights from weight_loader if specified (for fine-tuning)
@@ -730,13 +842,27 @@ def train_loop(config: _config.TrainConfig):
 
             # Forward pass
             losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
+            fm_loss_v = None
+            ce_loss_v = None
+            if isinstance(losses, dict):
+                loss = losses["loss"]
+                if "fm_loss" in losses:
+                    fm_loss_v = float(losses["fm_loss"].detach())
+                if "ce_loss" in losses:
+                    ce_loss_v = float(losses["ce_loss"].detach())
+            elif isinstance(losses, list | tuple):
                 losses = torch.stack(losses)
+                loss = losses.mean()
             elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+                loss = torch.tensor(losses, device=device, dtype=torch.float32)
+            else:
+                loss = losses.mean()
 
-            loss = losses.mean()
+            # per-joint × per-timestep 探针：不进反传，只取 batch 均值
+            fm_probe = None
+            if isinstance(losses, torch.Tensor) and losses.dim() == 3:
+                with torch.no_grad():
+                    fm_probe = losses.detach().float().mean(dim=0).cpu().numpy()  # [H, D]
 
             # Backward pass
             loss.backward()
@@ -761,13 +887,18 @@ def train_loop(config: _config.TrainConfig):
 
             # Collect stats
             if is_main:
-                infos.append(
-                    {
-                        "loss": loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                    }
-                )
+                info = {
+                    "loss": loss.item(),
+                    "learning_rate": optim.param_groups[0]["lr"],
+                    "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                }
+                if fm_loss_v is not None:
+                    info["fm_loss"] = fm_loss_v
+                if ce_loss_v is not None:
+                    info["ce_loss"] = ce_loss_v
+                if fm_probe is not None:
+                    info["fm_probe"] = fm_probe
+                infos.append(info)
 
             if is_main and (global_step % config.log_interval == 0) and infos:
                 elapsed = time.time() - start_time
@@ -775,6 +906,16 @@ def train_loop(config: _config.TrainConfig):
                 # Average stats over log interval
                 avg_loss = sum(info["loss"] for info in infos) / len(infos)
                 avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
+                avg_fm = None
+                avg_ce = None
+                if any("fm_loss" in info for info in infos):
+                    avg_fm = sum(info["fm_loss"] for info in infos if "fm_loss" in info) / max(
+                        1, sum(1 for info in infos if "fm_loss" in info)
+                    )
+                if any("ce_loss" in info for info in infos):
+                    avg_ce = sum(info["ce_loss"] for info in infos if "ce_loss" in info) / max(
+                        1, sum(1 for info in infos if "ce_loss" in info)
+                    )
 
                 avg_grad_norm = None
                 if any("grad_norm" in info for info in infos):
@@ -793,13 +934,18 @@ def train_loop(config: _config.TrainConfig):
                         epoch=(global_step / steps_per_epoch) if steps_per_epoch else None,
                     )
                 )
-                # Keep a human-readable summary as well.
+                extra = ""
+                if avg_fm is not None and avg_ce is not None:
+                    extra = f" fm={avg_fm:.4f} ce={avg_ce:.4f}"
                 logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
+                    f"step={global_step} loss={avg_loss:.4f}{extra} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
                     if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
+                    else f"step={global_step} loss={avg_loss:.4f}{extra} lr={avg_lr:.2e} time={elapsed:.1f}s"
                 )
 
+                probe_mats = [i["fm_probe"] for i in infos if "fm_probe" in i]
+                if probe_mats:
+                    _write_loss_probe(config.checkpoint_dir, global_step, sum(probe_mats) / len(probe_mats))
                 while loss_steps and loss_steps[-1] >= int(global_step):
                     loss_steps.pop()
                     loss_values.pop()

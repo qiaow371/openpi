@@ -228,6 +228,29 @@ def create_torch_dataset(
                 "data.prompt_from_subtask=true but meta/episodes_detailed_task.jsonl missing; using global task only"
             )
 
+    if getattr(data_config, "subtask_ce", False):
+        root = pathlib.Path(dataset_meta.root) / "meta"
+        spans_file = None
+        for name in ("episodes_detailed_task.jsonl", "subtask_spans.jsonl"):
+            cand = root / name
+            if cand.is_file():
+                spans_file = cand
+                break
+        if spans_file is not None:
+            cov = inspect_subtask_sidecar(str(dataset_meta.root))
+            logging.info(
+                "Attaching subtask CE labels from %s (%s/%s episodes, %s spans); action prompt stays task",
+                spans_file,
+                cov["annotated_episodes"],
+                cov["total_episodes"],
+                cov["spans"],
+            )
+            dataset = TransformedDataset(dataset, [_transforms.AttachSubtaskFromSpans.from_jsonl(spans_file)])
+        else:
+            logging.warning(
+                "data.subtask_ce=true but meta/episodes_detailed_task.jsonl missing; CE labels will be empty"
+            )
+
     return dataset
 
 
@@ -549,6 +572,7 @@ class TorchDataLoader:
             num_workers=num_workers,
             multiprocessing_context=mp_context,
             persistent_workers=num_workers > 0,
+            prefetch_factor=8 if num_workers > 0 else None,
             collate_fn=_collate_fn,
             worker_init_fn=_worker_init_fn,
             drop_last=True,
@@ -578,11 +602,24 @@ class TorchDataLoader:
                     yield jax.tree.map(torch.as_tensor, batch)
 
 
+def _drop_non_numeric(tree):
+    """torch.as_tensor cannot take numpy.str_ / object leaves (e.g. leftover subtask text)."""
+    if isinstance(tree, dict):
+        out = {}
+        for key, value in tree.items():
+            if isinstance(value, np.ndarray) and value.dtype.kind in ("U", "S", "O"):
+                continue
+            out[key] = _drop_non_numeric(value)
+        return out
+    return tree
+
+
 def _collate_fn(items):
     """Collate the batch elements into batched numpy arrays."""
     # Make sure to convert to numpy arrays before stacking since some of the incoming elements
     # may be JAX arrays.
-    return jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+    batched = jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+    return _drop_non_numeric(batched)
 
 
 def _worker_init_fn(worker_id: int) -> None:
@@ -591,6 +628,13 @@ def _worker_init_fn(worker_id: int) -> None:
     # means that this approach will not work for selecting the backend.
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+    # Limit PyTorch intra-op threads to 1 per worker to reduce context switching
+    torch.set_num_threads(1)
+    os.sched_setaffinity(0, set(range(320, 640)))
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass  # Already initialized
 
 
 class RLDSDataLoader:

@@ -1,9 +1,13 @@
 import logging
 import os
+import pathlib
 
 import jax
 import numpy as np
-import orbax.checkpoint as ocp
+try:
+    import orbax.checkpoint as ocp
+except Exception:
+    ocp = None  # type: ignore[assignment]
 import sentencepiece
 from transformers import AutoProcessor
 
@@ -11,13 +15,26 @@ import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
 
 
+def _load_sentencepiece() -> sentencepiece.SentencePieceProcessor:
+    candidates = []
+    env = os.environ.get("PALIGEMMA_TOKENIZER_PATH")
+    if env:
+        candidates.append(pathlib.Path(env))
+    candidates.append(pathlib.Path("/workspace/openpi/models/pi05_fixed/tokenizer.model"))
+    for p in candidates:
+        if p.is_file():
+            sp = sentencepiece.SentencePieceProcessor()
+            sp.Load(str(p))
+            return sp
+    path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+    with path.open("rb") as f:
+        return sentencepiece.SentencePieceProcessor(model_proto=f.read())
+
+
 class PaligemmaTokenizer:
     def __init__(self, max_len: int = 48):
         self._max_len = max_len
-
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
-        with path.open("rb") as f:
-            self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+        self._tokenizer = _load_sentencepiece()
 
     def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
@@ -46,6 +63,43 @@ class PaligemmaTokenizer:
             mask = [True] * self._max_len
 
         return np.asarray(tokens), np.asarray(mask)
+
+    def tokenize_subtask_ce(self, task: str, subtask: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Task prompt + images (added in the model) → subtask token CE labels.
+
+        Does not overwrite the action-FM prompt. Empty subtask → all labels -100.
+        """
+        template = f"Task: {task.strip()}\nWhat is the current subtask?\nSubtask:"
+        prefix = list(self._tokenizer.encode(template, add_bos=True))
+        suffix: list[int] = []
+        if subtask and str(subtask).strip():
+            suffix = list(self._tokenizer.encode(str(subtask).strip(), add_bos=False))
+            eos = int(self._tokenizer.eos_id())
+            if eos >= 0:
+                suffix.append(eos)
+        ids = prefix + suffix
+        labs = [-100] * len(prefix) + suffix
+        tokens_len = len(ids)
+        if tokens_len < self._max_len:
+            pad_n = self._max_len - tokens_len
+            ids = ids + [0] * pad_n
+            labs = labs + [-100] * pad_n
+            mask = [True] * tokens_len + [False] * pad_n
+        else:
+            if tokens_len > self._max_len:
+                logging.warning(
+                    "subtask CE token length (%s) exceeds max_len (%s), truncating",
+                    tokens_len,
+                    self._max_len,
+                )
+            ids = ids[: self._max_len]
+            labs = labs[: self._max_len]
+            mask = [True] * self._max_len
+        return (
+            np.asarray(ids, dtype=np.int32),
+            np.asarray(mask, dtype=bool),
+            np.asarray(labs, dtype=np.int32),
+        )
 
 
 class FASTTokenizer:

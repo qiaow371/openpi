@@ -1,0 +1,58 @@
+# π0.5 on 4× Ascend 910 (Atlas 800I A3, NPU 4-7) — dataset 00073，完整基座
+# 与 npu4 00036 同一套推荐档：bs64 / lr 3.5e-5 / AH16 / workers 8 / save 500
+# 相对 8 卡 npu8：global 128→64，peak 7e-5→3.5e-5（略降），AH 50→16
+# num_epochs 25 不变 ⇒ 3035 步/ep × 25 = 75875 步
+# 启动前须先停掉 8 卡 00073（NPU 8-15）；本文件不覆盖那次 run 的目录名
+config_name: pi05_aloha
+framework: pytorch
+
+exp_name: 00073_PI05_npu4_bs64_lr3.5e-5_ah16_fixbase
+project_name: openpi
+checkpoint_base_dir: ./checkpoints
+assets_base_dir: ./assets
+
+batch_size: 64           # TOTAL across 4 NPUs = 16 per NPU
+num_epochs: 25
+seed: 42
+num_workers: 8
+log_interval: 50
+
+save_every_epochs: null
+save_interval: 500
+save_full_every_epochs: null
+keep_period: 5000
+overwrite: true
+resume: false
+wandb_enabled: false
+fsdp_devices: 4
+ema_decay: 0.99
+
+pytorch_training_precision: bfloat16
+pytorch_weight_path: /home/pi05/models
+
+model:
+  action_horizon: 16
+
+lr_schedule:
+  warmup_steps: 2000
+  peak_lr: 3.5e-5
+  decay_lr: 3.5e-6
+  decay_steps: 75900      # ≈ 3035×25 = 75875
+
+optimizer:
+  b1: 0.9
+  b2: 0.95
+  eps: 1.0e-8
+  weight_decay: 1.0e-10
+  clip_gradient_norm: 1.0
+
+data:
+  repo_id: /home/pi05/00073_20260818_RM_01_yj_21
+  assets:
+    assets_dir: /home/pi05/00073_20260818_RM_01_yj_21
+    asset_id: "."
+  default_prompt: "Using both hands, pick up the courier items from the green conveyor belt. Place the white courier bags into the left box and the brown courier boxes into the right box."
+  prompt_from_task: true
+  prompt_from_subtask: false
+  adapt_to_pi: false
+  delta_action_dims: [7, 7, -1, -1]

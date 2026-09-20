@@ -13,7 +13,10 @@ from flax import traverse_util
 import jax
 import jax.numpy as jnp
 import numpy as np
-import orbax.checkpoint as ocp
+try:
+    import orbax.checkpoint as ocp
+except Exception:
+    ocp = None  # type: ignore[assignment]
 import safetensors
 import torch
 
@@ -133,6 +136,10 @@ class Observation(Generic[ArrayT]):
     token_ar_mask: at.Int[ArrayT, "*b l"] | None = None
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
+    # Optional PaliGemma CE: Task+images → subtask (action FM still uses tokenized_prompt).
+    tokenized_subtask_ce: at.Int[ArrayT, "*b l"] | None = None
+    tokenized_subtask_ce_mask: at.Bool[ArrayT, "*b l"] | None = None
+    tokenized_subtask_ce_labels: at.Int[ArrayT, "*b l"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -188,6 +195,9 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            tokenized_subtask_ce=data.get("tokenized_subtask_ce"),
+            tokenized_subtask_ce_mask=data.get("tokenized_subtask_ce_mask"),
+            tokenized_subtask_ce_labels=data.get("tokenized_subtask_ce_labels"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -278,6 +288,9 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        tokenized_subtask_ce=observation.tokenized_subtask_ce,
+        tokenized_subtask_ce_mask=observation.tokenized_subtask_ce_mask,
+        tokenized_subtask_ce_labels=observation.tokenized_subtask_ce_labels,
     )
 
 

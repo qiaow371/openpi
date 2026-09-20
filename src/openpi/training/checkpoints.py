@@ -11,8 +11,14 @@ from typing import Protocol
 
 from etils import epath
 import jax
-import orbax.checkpoint as ocp
-import orbax.checkpoint.future as future
+try:
+    import orbax.checkpoint as ocp
+except Exception:
+    ocp = None  # type: ignore[assignment]
+try:
+    import orbax.checkpoint.future as future
+except Exception:
+    future = None  # type: ignore[assignment]
 
 from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
@@ -354,7 +360,8 @@ class Callback(Protocol):
     def __call__(self, directory: epath.Path) -> None: ...
 
 
-class CallbackHandler(ocp.AsyncCheckpointHandler):
+_ocp_base = ocp.AsyncCheckpointHandler if ocp is not None else object
+class CallbackHandler(_ocp_base):
     """A CheckpointHandler for calling an arbitrary function asynchronously. Only for saving, not for restoring."""
 
     def save(self, directory: epath.Path, args: CallbackSave):
@@ -368,14 +375,15 @@ class CallbackHandler(ocp.AsyncCheckpointHandler):
         raise NotImplementedError("CallbackHandler does not support restore")
 
 
-@ocp.args.register_with_handler(CallbackHandler, for_save=True)
+_noop = lambda cls: cls
+_cb_base = ocp.args.CheckpointArgs if ocp else object
+
 @dataclasses.dataclass
-class CallbackSave(ocp.args.CheckpointArgs):
+class CallbackSave(_cb_base):
     callback: Callback
 
 
-@ocp.args.register_with_handler(CallbackHandler, for_restore=True)
-class CallbackRestore(ocp.args.CheckpointArgs): ...
+class CallbackRestore(_cb_base): ...
 
 
 def _split_params(state: training_utils.TrainState) -> tuple[training_utils.TrainState, at.Params]:

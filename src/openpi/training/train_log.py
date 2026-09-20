@@ -405,6 +405,8 @@ def save_train_config(
     prompt_meta = {
         "prompt_from_task": bool(getattr(data, "prompt_from_task", False)) if data is not None else None,
         "prompt_from_subtask": bool(getattr(data, "prompt_from_subtask", False)) if data is not None else None,
+        "subtask_ce": bool(getattr(data, "subtask_ce", False)) if data is not None else None,
+        "subtask_ce_weight": getattr(data, "subtask_ce_weight", None) if data is not None else None,
         "repo_id": getattr(data, "repo_id", None) if data is not None else None,
     }
     try:
@@ -493,6 +495,7 @@ def _read_cpu_mem() -> dict[str, Any]:
 
 
 def _read_gpu_usage() -> list[dict[str, Any]]:
+    # Try nvidia-smi first (NVIDIA GPU environments)
     query = (
         "index,name,utilization.gpu,utilization.memory,"
         "memory.used,memory.total,temperature.gpu,power.draw"
@@ -509,31 +512,108 @@ def _read_gpu_usage() -> list[dict[str, Any]]:
             text=True,
             timeout=5,
         )
+        if result.returncode == 0 and result.stdout.strip():
+            gpus: list[dict[str, Any]] = []
+            for line in result.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 8:
+                    continue
+                gpus.append(
+                    {
+                        "index": int(parts[0]) if parts[0].isdigit() else parts[0],
+                        "name": parts[1],
+                        "utilization_gpu_pct": _maybe_float(parts[2]),
+                        "utilization_memory_pct": _maybe_float(parts[3]),
+                        "memory_used_mb": _maybe_float(parts[4]),
+                        "memory_total_mb": _maybe_float(parts[5]),
+                        "temperature_c": _maybe_float(parts[6]),
+                        "power_draw_w": _maybe_float(parts[7]),
+                    }
+                )
+            if gpus:
+                return gpus
+    except Exception:
+        pass
+
+    # Fall back to npu-smi (Ascend NPU environments)
+    try:
+        result = subprocess.run(
+            ["npu-smi", "info"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
     except Exception as exc:
-        return [{"error": f"nvidia-smi unavailable: {exc}"}]
+        return [{"error": f"nvidia-smi and npu-smi both unavailable: {exc}"}]
 
     if result.returncode != 0:
-        err = (result.stderr or result.stdout or "").strip()
-        return [{"error": err or f"nvidia-smi exit {result.returncode}"}]
+        return [{"error": f"npu-smi exit {result.returncode}: {(result.stderr or "").strip()}"}]
 
-    gpus: list[dict[str, Any]] = []
-    for line in result.stdout.strip().splitlines():
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 8:
-            continue
-        gpus.append(
-            {
-                "index": int(parts[0]) if parts[0].isdigit() else parts[0],
-                "name": parts[1],
-                "utilization_gpu_pct": _maybe_float(parts[2]),
-                "utilization_memory_pct": _maybe_float(parts[3]),
-                "memory_used_mb": _maybe_float(parts[4]),
-                "memory_total_mb": _maybe_float(parts[5]),
-                "temperature_c": _maybe_float(parts[6]),
-                "power_draw_w": _maybe_float(parts[7]),
-            }
-        )
-    return gpus
+    gpus = []
+    lines = result.stdout.strip().splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        # NPU data rows start with "| <digit>"
+        if re.match(r"^\|\s+\d+\s+Ascend", line):
+            parts = [p.strip() for p in line.split("|")]
+            # parts: [, 0 Ascend910, OK, 165.7 40 0 / 0, ]
+            if len(parts) >= 4:
+                npu_name_parts = parts[1].split()
+                npu_index = int(npu_name_parts[0]) if npu_name_parts[0].isdigit() else npu_name_parts[0]
+                npu_name = " ".join(npu_name_parts[1:]) if len(npu_name_parts) > 1 else "Ascend"
+                # Power and Temp are in parts[3]: "165.7       40                0    / 0"
+                metrics = parts[3].split()
+                power_w = _maybe_float(metrics[0]) if len(metrics) > 0 else None
+                temp_c = _maybe_float(metrics[1]) if len(metrics) > 1 else None
+
+                # Next line has chip-level info with AICore(%) and HBM-Usage
+                aicore_pct = None
+                hbm_used = None
+                hbm_total = None
+                if i + 1 < len(lines):
+                    chip_line = lines[i + 1].strip()
+                    if chip_line.startswith("|") and "0000:" in chip_line:
+                        chip_parts = [p.strip() for p in chip_line.split("|")]
+                        if len(chip_parts) >= 4:
+                            chip_metrics = chip_parts[3].split()
+                            # chip_metrics: [0, 0, /, 0, 3115, /, 65536]
+                            # AICore(%) is first value, HBM-Usage is last "used / total"
+                            if len(chip_metrics) > 0:
+                                aicore_pct = _maybe_float(chip_metrics[0])
+                            # Find HBM-Usage pattern "used / total"
+                            hbm_match = re.search(r"(\d+)\s*/\s*(\d+)\s*$", chip_parts[3])
+                            if hbm_match:
+                                hbm_used = _maybe_float(hbm_match.group(1))
+                                hbm_total = _maybe_float(hbm_match.group(2))
+                            # Also try to find Memory-Usage pattern (second "used / total")
+                            mem_matches = re.findall(r"(\d+)\s*/\s*(\d+)", chip_parts[3])
+                            if len(mem_matches) >= 2:
+                                # First match is Memory-Usage, second is HBM-Usage
+                                mem_used = _maybe_float(mem_matches[0][0])
+                                mem_total = _maybe_float(mem_matches[0][1])
+                            else:
+                                mem_used = hbm_used
+                                mem_total = hbm_total
+
+                            mem_util = (mem_used / mem_total * 100.0) if (isinstance(mem_used, (int, float)) and isinstance(mem_total, (int, float)) and mem_total > 0) else 0.0
+
+                            gpus.append({
+                                "index": npu_index,
+                                "name": npu_name,
+                                "utilization_gpu_pct": aicore_pct,
+                                "utilization_memory_pct": mem_util,
+                                "memory_used_mb": mem_used,
+                                "memory_total_mb": mem_total,
+                                "temperature_c": temp_c,
+                                "power_draw_w": power_w,
+                            })
+                i += 2
+                continue
+        i += 1
+
+    return gpus if gpus else [{"error": "no NPU info parsed from npu-smi output"}]
 
 
 def _maybe_float(value: str) -> float | str | None:

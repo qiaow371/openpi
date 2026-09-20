@@ -89,6 +89,6 @@ data:
   default_prompt: "With both hands, pick up the yellow banana and the yellow lemon and put them into the black box; then take the green vegetables and place them into the blue box."
   prompt_from_task: true
   # annotate_pipeline compose → vlm_subtask export 写入 meta/episodes_detailed_task.jsonl 后按帧用 action_text
-  prompt_from_subtask: true
+  prompt_from_subtask: false
   adapt_to_pi: false
   delta_action_dims: [7, 7, -1, -1]
