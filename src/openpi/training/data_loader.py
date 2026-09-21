@@ -228,6 +228,42 @@ def create_torch_dataset(
                 "data.prompt_from_subtask=true but meta/episodes_detailed_task.jsonl missing; using global task only"
             )
 
+    if getattr(data_config, "subtask_ce", False):
+        root = pathlib.Path(dataset_meta.root) / "meta"
+        spans_file = None
+        for name in ("episodes_detailed_task.jsonl", "subtask_spans.jsonl"):
+            cand = root / name
+            if cand.is_file():
+                spans_file = cand
+                break
+        if spans_file is not None:
+            cov = inspect_subtask_sidecar(str(dataset_meta.root))
+            logging.info(
+                "Attaching subtask CE labels from %s (%s/%s episodes, %s spans); action prompt stays task",
+                spans_file,
+                cov["annotated_episodes"],
+                cov["total_episodes"],
+                cov["spans"],
+            )
+            dataset = TransformedDataset(dataset, [_transforms.AttachSubtaskFromSpans.from_jsonl(spans_file)])
+        else:
+            logging.warning(
+                "data.subtask_ce=true but meta/episodes_detailed_task.jsonl missing; CE labels will be empty"
+            )
+
+    # Debug log: keep per-frame subtask text for detailed_loss/subtask/* even when
+    # it is not the action prompt and CE is off. Does not overwrite ``prompt``.
+    if not getattr(data_config, "subtask_ce", False):
+        root = pathlib.Path(dataset_meta.root) / "meta"
+        spans_file = None
+        for name in ("episodes_detailed_task.jsonl", "subtask_spans.jsonl"):
+            cand = root / name
+            if cand.is_file():
+                spans_file = cand
+                break
+        if spans_file is not None:
+            dataset = TransformedDataset(dataset, [_transforms.AttachSubtaskFromSpans.from_jsonl(spans_file)])
+
     return dataset
 
 
@@ -578,11 +614,96 @@ class TorchDataLoader:
                     yield jax.tree.map(torch.as_tensor, batch)
 
 
+def _drop_non_numeric(tree):
+    """torch.as_tensor cannot take numpy.str_ / object leaves (e.g. leftover subtask text)."""
+    if isinstance(tree, dict):
+        out = {}
+        for key, value in tree.items():
+            if isinstance(value, np.ndarray) and value.dtype.kind in ("U", "S", "O"):
+                continue
+            out[key] = _drop_non_numeric(value)
+        return out
+    return tree
+
+
+_LOSS_CAT_MAX = 96  # utf-8 bytes; closed-set subtask phrases fit, long task prompts do not
+
+
+def _item_cat_str(item, key: str) -> str:
+    if not isinstance(item, dict):
+        return ""
+    v = item.get(key, "")
+    if v is None:
+        return ""
+    if hasattr(v, "item"):
+        try:
+            v = v.item()
+        except Exception:
+            v = str(v)
+    return str(v).strip()
+
+
+def _encode_loss_cat_batch(strs: list[str], max_len: int = _LOSS_CAT_MAX) -> np.ndarray:
+    arr = np.zeros((len(strs), max_len), dtype=np.uint8)
+    for i, s in enumerate(strs):
+        b = (s or "").encode("utf-8", errors="replace")[:max_len]
+        if b:
+            arr[i, : len(b)] = np.frombuffer(b, dtype=np.uint8)
+    return arr
+
+
+def _decode_loss_cat_batch(tensor) -> list[str] | None:
+    if tensor is None:
+        return None
+    if hasattr(tensor, "detach"):
+        tensor = tensor.detach().cpu().numpy()
+    arr = np.asarray(tensor)
+    if arr.ndim != 2:
+        return None
+    out = []
+    for row in arr:
+        text = bytes(int(x) for x in row.tolist()).split(b"\x00", 1)[0]
+        out.append(text.decode("utf-8", errors="replace").strip())
+    return out
+
+
+def _pack_loss_cats(items) -> dict:
+    """Keep prompt/subtask through collate as uint8 so debug log can group FM by category."""
+    packed = {}
+    prompts = [_item_cat_str(it, "prompt") for it in items]
+    subtasks = [_item_cat_str(it, "subtask") for it in items]
+    if any(prompts):
+        packed["loss_cat_prompt"] = _encode_loss_cat_batch(prompts)
+    if any(subtasks):
+        packed["loss_cat_subtask"] = _encode_loss_cat_batch(subtasks)
+    return packed
+
+
+def _unpack_loss_cats(batch, data_config) -> dict:
+    repo = ""
+    if data_config is not None:
+        repo = str(getattr(data_config, "repo_id", "") or "")
+    repo = os.path.basename(str(repo).rstrip("/")) or "dataset"
+    cats = {"dataset": repo}
+    if isinstance(batch, dict):
+        decoded = _decode_loss_cat_batch(batch.get("loss_cat_subtask"))
+        if decoded:
+            cats["subtask"] = decoded
+        decoded_p = _decode_loss_cat_batch(batch.get("loss_cat_prompt"))
+        if decoded_p:
+            cats["prompt"] = decoded_p
+    return cats
+
+
 def _collate_fn(items):
     """Collate the batch elements into batched numpy arrays."""
     # Make sure to convert to numpy arrays before stacking since some of the incoming elements
     # may be JAX arrays.
-    return jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+    batched = jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+    batched = _drop_non_numeric(batched)
+    if isinstance(batched, dict):
+        batched.update(_pack_loss_cats(items))
+    return batched
 
 
 def _worker_init_fn(worker_id: int) -> None:
@@ -647,4 +768,5 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
+            self._debug_loss_cats = _unpack_loss_cats(batch, self._data_config)
             yield _model.Observation.from_dict(batch), batch["actions"]

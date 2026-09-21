@@ -28,6 +28,8 @@ import gc
 import logging
 import os
 import platform
+import json
+import struct
 import shutil
 import time
 
@@ -323,6 +325,583 @@ def log_memory_usage(device, step, phase="unknown"):
     )
 
 
+# ---------------------------------------------------------------------------
+# 基座权重完整性硬校验（2026-09-14 华为 16 NPU π0.5 事故复盘）
+# ---------------------------------------------------------------------------
+# warm start 用 strict=False 是必要的：本地 vendor 的 PaliGemma 把 tied 权重挂在
+# ``paligemma.model.language_model.embed_tokens.weight``，HF 的 PaliGemma 不注册该 key。
+# 但 strict=False 也会把「传错 / 只传了一半」的基座静默吞掉：只含 PaliGemma 的
+# ``pi05_fixed_paligemma/model.safetensors``（604 张量）相对完整 π0.5（813 张量）缺 209 个
+# gemma_expert / action_in_proj / action_out_proj / time_mlp_* 张量 —— 动作专家随机初始化，
+# 训练照样跑、train loss 照样降到 1e-3，只有真机评估才发现（华为效果差的根因）。
+# 因此把容错收紧：缺失 key 只允许白名单，且基座必须真的含动作专家。
+
+_BASE_MISSING_ALLOWLIST = ("language_model.embed_tokens.weight",)
+_BASE_REQUIRED_PREFIXES = (
+    "paligemma_with_expert.gemma_expert.",  # 动作专家主干
+    "action_in_proj.",  # 动作/状态输入投影
+    "action_out_proj.",  # 动作输出头
+)
+
+
+def _safetensors_keys(path: str) -> list[str]:
+    """只读 safetensors 头部取 key 列表，不加载张量数据（头部一般几十 KB）。"""
+    with open(path, "rb") as f:
+        (head_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(head_len))
+    return [k for k in header if k != "__metadata__"]
+
+
+def _assert_base_complete(model_path: str, missing: list[str] | None = None) -> None:
+    """校验基座确实含动作专家与动作投影，且 missing 只在白名单内，否则抛错中止训练。"""
+    keys = _safetensors_keys(model_path)
+    absent = [prefix for prefix in _BASE_REQUIRED_PREFIXES if not any(k.startswith(prefix) for k in keys)]
+    if absent:
+        raise RuntimeError(
+            f"基座权重不完整：{model_path} 只有 {len(keys)} 个张量，完全不含 {absent}。"
+            " 多半是误用了只含 PaliGemma 的半成品（如 pi05_fixed_paligemma），"
+            " 继续训练会让动作专家随机初始化。请改用完整基座 pi05_fixed/。"
+        )
+    unknown = [k for k in (missing or []) if not any(allowed in k for allowed in _BASE_MISSING_ALLOWLIST)]
+    if unknown:
+        raise RuntimeError(
+            f"基座权重缺少 {len(unknown)} 个非白名单张量（示例：{unknown[:5]}），"
+            " 中止训练以免半随机初始化。"
+        )
+    logging.info("Base weight check OK: %s tensors, missing=%s (allowlist only)", len(keys), len(missing or []))
+
+
+# ---------------------------------------------------------------------------
+# per-joint × per-timestep loss 探针（2026-09-14 华为 π0.5 事故复盘）
+# ---------------------------------------------------------------------------
+# 标量 loss = mean([B, H, D]) 会掩盖所有结构性问题。这里保留 [H, D] 矩阵落盘。
+# 判据：D=32 中后 16 维是 pad 0，其目标 u = ε，而 x_t = t·ε 使 ε 完全可知，
+# 所以预训练好的 π0.5 pad 维 loss 已接近 0 —— pad_mean ≈ 1 等价于"动作专家是冷的"。
+_PROBE_REAL_DIM = 16
+_PROBE_PAD_MEAN_COLD = 0.5
+
+
+def _loss_probe_stats(mat) -> dict:
+    """[H, D] numpy 矩阵 → 可直接喂 LLM 的摘要 dict。"""
+    real = mat[:, :_PROBE_REAL_DIM]
+    pad = mat[:, _PROBE_REAL_DIM:]
+    dim = real.mean(axis=0)
+    return {
+        "dim_real": [round(float(v), 5) for v in dim],
+        "per_step": [round(float(v), 5) for v in mat.mean(axis=1)],
+        "matrix": [[round(float(v), 5) for v in row] for row in mat],
+        "real_mean": round(float(real.mean()), 5),
+        "pad_mean": round(float(pad.mean()), 5),
+        "worst_dim": int(dim.argmax()),
+        "best_dim": int(dim.argmin()),
+        "verdict": "cold-expert" if float(pad.mean()) > _PROBE_PAD_MEAN_COLD else "warm",
+    }
+
+
+def _write_loss_probe(checkpoint_dir: str, step, mat) -> None:
+    """把 [H, D] 均值矩阵追加成一行 JSON。任何异常都只 warning —— 探针不许弄死训练。"""
+    try:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        path = os.path.join(checkpoint_dir, "loss_probe.jsonl")
+        rec = {"step": int(step)}
+        rec.update(_loss_probe_stats(mat))
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+        logging.info(
+            "PROBE step=%s real=%.4f pad=%.4f worst=d%d(%.3f) best=d%d(%.3f) verdict=%s",
+            step,
+            rec["real_mean"],
+            rec["pad_mean"],
+            rec["worst_dim"],
+            rec["dim_real"][rec["worst_dim"]],
+            rec["best_dim"],
+            rec["dim_real"][rec["best_dim"]],
+            rec["verdict"],
+        )
+    except Exception as e:  # noqa: BLE001 - 探针失败不能影响训练
+        logging.warning("loss probe 写入失败（忽略）：%s", e)
+
+
+class ActionDimAbort(RuntimeError):
+    """逐维 loss 门禁触发。训练循环应让它冒泡退出，不要吞掉。"""
+
+
+DIM_NAMES = [f"L{j}" for j in range(1, 8)] + [f"R{j}" for j in range(1, 8)] + ["Lgrip", "Rgrip"]
+REAL_DIM = 16
+GUARD_UNTIL_STEP = 100
+# 健康 run 起训单维 <1.4、max/median ≤3.1；有毒 00036 起训单维 12~15、比值 35~40。
+ABS_ABORT = 5.0
+RATIO_ABORT = 8.0
+RATIO_MIN_MEDIAN = 0.05
+PAD_ABORT = 0.1
+SCALAR_ABORT = 1.0
+
+
+def _evaluate_action_dims(mat, step=0, scalar_loss=None) -> dict:
+    """[H, D] 矩阵 → {abort, codes, reasons, ...}。不抛错。"""
+    arr = np.asarray(mat, dtype=np.float64)
+    step = int(step)
+    codes: list[str] = []
+    reasons: list[str] = []
+
+    if arr.ndim != 2 or arr.size == 0:
+        codes.append("bad_shape")
+        reasons.append(f"探针矩阵形状异常：{getattr(arr, 'shape', None)}")
+        return {
+            "abort": True,
+            "step": step,
+            "codes": codes,
+            "reasons": reasons,
+            "dim_real": [],
+            "pad_mean": None,
+            "real_mean": None,
+            "scalar_loss": None if scalar_loss is None else float(scalar_loss),
+            "worst_dim": None,
+            "worst_name": None,
+            "worst_val": None,
+            "median": None,
+            "ratio": None,
+            "window": step <= GUARD_UNTIL_STEP,
+        }
+
+    if not np.isfinite(arr).all():
+        codes.append("nan")
+        reasons.append("逐维 loss 出现 NaN/Inf")
+
+    n_real = min(REAL_DIM, arr.shape[1])
+    real = arr[:, :n_real]
+    dim = real.mean(axis=0)
+    pad = arr[:, n_real:] if arr.shape[1] > n_real else None
+    pad_mean = float(pad.mean()) if pad is not None and pad.size else None
+    real_mean = float(real.mean())
+    worst = int(dim.argmax()) if dim.size else 0
+    worst_val = float(dim[worst]) if dim.size else None
+    median = float(np.median(dim)) if dim.size else None
+    ratio = (
+        float(worst_val / median)
+        if worst_val is not None and median is not None and median >= RATIO_MIN_MEDIAN
+        else None
+    )
+    name = DIM_NAMES[worst] if worst < len(DIM_NAMES) else f"d{worst}"
+    scalar = None if scalar_loss is None else float(scalar_loss)
+
+    if worst_val is not None and worst_val >= ABS_ABORT:
+        codes.append("dim_abs")
+        reasons.append(
+            f"{name}(d{worst})={worst_val:.3f} ≥ {ABS_ABORT}，单维爆炸"
+            "（stats/掩码拆开的典型形状，标量会被 pad 摊掉）"
+        )
+
+    in_window = step <= GUARD_UNTIL_STEP
+    if in_window and ratio is not None and ratio >= RATIO_ABORT:
+        codes.append("dim_ratio")
+        reasons.append(
+            f"前 {GUARD_UNTIL_STEP} 步 {name}/median = {ratio:.1f} ≥ {RATIO_ABORT}"
+            f"（median={median:.3f}）"
+        )
+
+    if pad_mean is not None and pad_mean >= PAD_ABORT:
+        codes.append("pad_cold")
+        reasons.append(
+            f"pad_mean={pad_mean:.4f} ≥ {PAD_ABORT}，动作专家冷启动（热基座应接近 0）"
+        )
+
+    if scalar is not None and scalar >= SCALAR_ABORT:
+        codes.append("scalar_cold")
+        reasons.append(f"标量 loss={scalar:.4f} ≥ {SCALAR_ABORT}，坏基座哨兵")
+
+    dim_real = [round(float(v), 5) for v in dim]
+    return {
+        "abort": bool(codes),
+        "step": step,
+        "codes": codes,
+        "reasons": reasons,
+        "dim_real": dim_real,
+        "dim_names": DIM_NAMES[:n_real],
+        "pad_mean": None if pad_mean is None else round(pad_mean, 5),
+        "real_mean": round(real_mean, 5),
+        "scalar_loss": None if scalar is None else round(scalar, 5),
+        "worst_dim": worst,
+        "worst_name": name,
+        "worst_val": None if worst_val is None else round(worst_val, 5),
+        "median": None if median is None else round(median, 5),
+        "ratio": None if ratio is None else round(ratio, 3),
+        "window": in_window,
+        "thresholds": {
+            "abs": ABS_ABORT,
+            "ratio": RATIO_ABORT,
+            "until_step": GUARD_UNTIL_STEP,
+            "pad": PAD_ABORT,
+            "scalar": SCALAR_ABORT,
+        },
+    }
+
+
+def _format_action_dim_abort_md(result: dict) -> str:
+    names = result.get("dim_names") or DIM_NAMES
+    dims = result.get("dim_real") or []
+    lines = [
+        "# π0.5 action-dim 门禁：训练已停止",
+        "",
+        f"- step: {result.get('step')}",
+        f"- codes: {', '.join(result.get('codes') or []) or '（无）'}",
+        f"- worst: {result.get('worst_name')}(d{result.get('worst_dim')})={result.get('worst_val')}",
+        f"- max/median: {result.get('ratio')}  (median={result.get('median')})",
+        f"- real_mean: {result.get('real_mean')}  pad_mean: {result.get('pad_mean')}",
+        f"- scalar_loss: {result.get('scalar_loss')}",
+        "",
+        "## 原因",
+        "",
+    ]
+    for r in result.get("reasons") or []:
+        lines.append(f"- {r}")
+    lines += ["", "## 前 16 维 FM-MSE（batch×chunk 均值）", "", "| dim | name | loss |", "|---:|---|---:|"]
+    for i, v in enumerate(dims):
+        n = names[i] if i < len(names) else f"d{i}"
+        mark = "  ← worst" if i == result.get("worst_dim") else ""
+        lines.append(f"| {i} | {n} | {v}{mark} |")
+    lines += [
+        "",
+        "提醒通道这次没接。看本文件和同目录 `action_dim_abort.json` / `loss_probe.jsonl`。",
+        "常见根因：`norm_stats` 与 `delta_action_dims` 掩码不一致，或动作专家没热加载。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _write_action_dim_abort_report(checkpoint_dir: str, result: dict) -> str:
+    """写 json + md，返回 md 路径。"""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    base = os.path.join(checkpoint_dir, "action_dim_abort")
+    json_path = base + ".json"
+    md_path = base + ".md"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(_format_action_dim_abort_md(result))
+    return md_path
+
+
+def _guard_action_dims(checkpoint_dir, step, mat, scalar_loss, is_main, device) -> None:
+    """前 100 步盯全部 action dim；异常写 report 并停训。PI05_ACTION_DIM_GUARD=0 可关。"""
+    if os.environ.get("PI05_ACTION_DIM_GUARD", "1").strip().lower() in ("0", "false", "off", "no"):
+        return
+    result = _evaluate_action_dims(mat, step=int(step), scalar_loss=scalar_loss)
+    abort = bool(result["abort"])
+    try:
+        if dist.is_available() and dist.is_initialized():
+            flag = torch.tensor([1 if abort else 0], device=device, dtype=torch.int32)
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+            abort = bool(int(flag.item()))
+    except Exception:  # noqa: BLE001 - 集合失败时仍用本 rank 的判断
+        pass
+    if not abort:
+        return
+    if is_main:
+        try:
+            md = _write_action_dim_abort_report(checkpoint_dir, result)
+            logging.error("ACTION-DIM ABORT report=%s", md)
+        except Exception as e:  # noqa: BLE001
+            logging.error("ACTION-DIM ABORT 写 report 失败：%s", e)
+        try:
+            _write_loss_probe(checkpoint_dir, step, mat)
+        except Exception:  # noqa: BLE001
+            pass
+    msg = "; ".join(result.get("reasons") or ["action-dim guard abort"])
+    logging.error("ACTION-DIM ABORT step=%s %s", step, msg)
+    raise ActionDimAbort(f"step={step} {msg}  (report: {checkpoint_dir}/action_dim_abort.md)")
+
+
+# ---------------------------------------------------------------------------
+# TensorBoard debug log（LingBot AsyncTBWriter 同款：rank0 异步标量）
+# jsonl 仍留给门禁回放；TB 给人看曲线。PI05_TB=0 可关。写失败只 warning。
+# ---------------------------------------------------------------------------
+_TB_WRITER = None
+_TB_DIM_NAMES = [f"L{j}" for j in range(1, 8)] + [f"R{j}" for j in range(1, 8)] + ["Lgrip", "Rgrip"]
+
+
+def _crc32c(data: bytes) -> int:
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x82F63B78 if crc & 1 else crc >> 1
+    return crc ^ 0xFFFFFFFF
+
+
+def _masked_crc32c(data: bytes) -> int:
+    crc = _crc32c(data) & 0xFFFFFFFF
+    return (((crc >> 15) | ((crc << 17) & 0xFFFFFFFF)) + 0xA282EAD8) & 0xFFFFFFFF
+
+
+def _tb_varint(n: int) -> bytes:
+    out = bytearray()
+    n = int(n) & ((1 << 64) - 1)
+    while n > 0x7F:
+        out.append((n & 0x7F) | 0x80)
+        n >>= 7
+    out.append(n)
+    return bytes(out)
+
+
+def _tb_key(field: int, wire: int) -> bytes:
+    return _tb_varint((field << 3) | wire)
+
+
+def _tb_len_delim(field: int, payload: bytes) -> bytes:
+    return _tb_key(field, 2) + _tb_varint(len(payload)) + payload
+
+
+def _tb_event_bytes(wall_time, step=None, file_version=None, tag=None, value=None) -> bytes:
+    import struct
+
+    body = _tb_key(1, 1) + struct.pack("<d", float(wall_time))
+    if step is not None:
+        body += _tb_key(2, 0) + _tb_varint(int(step))
+    if file_version is not None:
+        raw = str(file_version).encode("utf-8")
+        body += _tb_len_delim(3, raw)
+    if tag is not None:
+        tag_b = str(tag).encode("utf-8")
+        val = _tb_len_delim(1, tag_b) + _tb_key(2, 5) + struct.pack("<f", float(value))
+        body += _tb_len_delim(5, _tb_len_delim(1, val))
+    return body
+
+
+def _tb_tfrecord(payload: bytes) -> bytes:
+    import struct
+
+    header = struct.pack("<Q", len(payload))
+    return header + struct.pack("<I", _masked_crc32c(header)) + payload + struct.pack("<I", _masked_crc32c(payload))
+
+
+class _Pi05FallbackTBWriter:
+    """Valid tfevents scalars without the `tensorboard` pip extra."""
+
+    def __init__(self, log_dir):
+        import time
+
+        os.makedirs(log_dir, exist_ok=True)
+        fname = "events.out.tfevents.%s.%s.pi05" % (int(time.time()), os.getpid())
+        self._path = os.path.join(log_dir, fname)
+        self._fp = open(self._path, "wb")
+        self._fp.write(_tb_tfrecord(_tb_event_bytes(time.time(), file_version="brain.Event:2")))
+        self._fp.flush()
+
+    def add_scalar(self, tag, scalar_value, global_step):
+        import time
+
+        payload = _tb_event_bytes(time.time(), step=int(global_step), tag=str(tag), value=float(scalar_value))
+        self._fp.write(_tb_tfrecord(payload))
+
+    def flush(self):
+        self._fp.flush()
+
+    def close(self):
+        try:
+            self.flush()
+            self._fp.close()
+        except Exception:
+            pass
+
+
+def _open_tb_backend(log_dir):
+    force = os.environ.get("PI05_TB_BACKEND", "").strip().lower()
+    if force not in ("fallback", "raw"):
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+
+            return SummaryWriter(log_dir=log_dir)
+        except Exception as e:
+            logging.warning("SummaryWriter 不可用（%s）；改用无依赖 tfevents 回退", e)
+    return _Pi05FallbackTBWriter(log_dir)
+
+
+class _Pi05AsyncTBWriter:
+    _QUEUE_WARN_THRESHOLD = 500
+
+    def __init__(self, log_dir):
+        import queue
+        import threading
+        self._writer = _open_tb_backend(log_dir)
+        self._queue = queue.Queue()
+        self._warn_logged = False
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def add_scalar(self, tag, scalar_value, global_step):
+        try:
+            if self._queue.qsize() > self._QUEUE_WARN_THRESHOLD and not self._warn_logged:
+                logging.warning("pi05 TB: queue backlog=%s", self._queue.qsize())
+                self._warn_logged = True
+        except Exception:
+            pass
+        self._queue.put(("add_scalar", (tag, float(scalar_value), int(global_step))))
+
+    def flush(self):
+        self._queue.join()
+        try:
+            self._writer.flush()
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self.flush()
+            self._queue.put(None)
+            self._thread.join(timeout=10)
+            self._writer.close()
+        except Exception:
+            pass
+
+    def _worker(self):
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    break
+                method, args = item
+                getattr(self._writer, method)(*args)
+            except Exception as e:
+                logging.warning("pi05 TB write failed: %s", e)
+            finally:
+                self._queue.task_done()
+
+
+def _get_tb_writer(checkpoint_dir):
+    global _TB_WRITER
+    if os.environ.get("PI05_TB", "1").strip().lower() in ("0", "false", "off", "no"):
+        return None
+    if _TB_WRITER is False:
+        return None
+    if _TB_WRITER is not None:
+        return _TB_WRITER
+    try:
+        log_dir = os.path.join(str(checkpoint_dir), "tb")
+        os.makedirs(log_dir, exist_ok=True)
+        _TB_WRITER = _Pi05AsyncTBWriter(log_dir)
+        logging.info("TensorBoard debug log → %s", log_dir)
+    except Exception as e:
+        logging.warning("TensorBoard writer 创建失败（忽略）：%s", e)
+        _TB_WRITER = False
+    return _TB_WRITER if _TB_WRITER else None
+
+
+def _close_tb_writer() -> None:
+    global _TB_WRITER
+    w = _TB_WRITER
+    _TB_WRITER = False
+    if w and w is not False:
+        try:
+            w.close()
+        except Exception:
+            pass
+
+
+def _write_tb_debug(checkpoint_dir, step, infos, elapsed, log_interval) -> None:
+    """分项 / 逐维 / lr / grad_norm / 步时 → TB。失败只 warning。"""
+    try:
+        writer = _get_tb_writer(checkpoint_dir)
+        if writer is None or not infos:
+            return
+        n = max(1, len(infos))
+        avg_loss = sum(float(i["loss"]) for i in infos) / n
+        avg_lr = sum(float(i["learning_rate"]) for i in infos) / n
+        gn = [float(i["grad_norm"]) for i in infos if i.get("grad_norm") is not None]
+        avg_gn = (sum(gn) / len(gn)) if gn else None
+        fm_vals = [float(i["fm_loss"]) for i in infos if "fm_loss" in i]
+        ce_vals = [float(i["ce_loss"]) for i in infos if "ce_loss" in i]
+        writer.add_scalar("training/loss", avg_loss, step)
+        if fm_vals:
+            writer.add_scalar("training/action_loss", sum(fm_vals) / len(fm_vals), step)
+        else:
+            writer.add_scalar("training/action_loss", avg_loss, step)
+        if ce_vals:
+            writer.add_scalar("training/ce_loss", sum(ce_vals) / len(ce_vals), step)
+        if avg_gn is not None:
+            writer.add_scalar("training/grad_norm", avg_gn, step)
+        writer.add_scalar("training/lr", avg_lr, step)
+        writer.add_scalar("steptime", float(elapsed) / max(1, int(log_interval)), step)
+        cat_acc = {}
+        for i in infos:
+            for k, v in (i.get("cat_losses") or {}).items():
+                cat_acc.setdefault(k, []).append(float(v))
+        for k, vs in cat_acc.items():
+            writer.add_scalar("detailed_loss/%s" % k, sum(vs) / len(vs), step)
+        probe_mats = [i["fm_probe"] for i in infos if "fm_probe" in i]
+        if not probe_mats:
+            return
+        mat = sum(probe_mats) / len(probe_mats)
+        real = mat[:, :16]
+        dim = real.mean(axis=0)
+        for name, v in zip(_TB_DIM_NAMES, dim.tolist()):
+            writer.add_scalar("Action loss dim/%s" % name, float(v), step)
+        writer.add_scalar("training/real_mean", float(real.mean()), step)
+        if mat.shape[1] > 16:
+            writer.add_scalar("training/pad_mean", float(mat[:, 16:].mean()), step)
+        writer.add_scalar("Action loss group/joints", float(dim[:14].mean()), step)
+        writer.add_scalar("Action loss group/gripper", float(dim[14:16].mean()), step)
+        per_step = mat.mean(axis=1)
+        writer.add_scalar("Action loss step/first", float(per_step[0]), step)
+        writer.add_scalar("Action loss step/last", float(per_step[-1]), step)
+        writer.add_scalar(
+            "Action loss step/tail_head_ratio",
+            float(per_step[-1]) / (float(per_step[0]) + 1e-8),
+            step,
+        )
+    except Exception as e:
+        logging.warning("TB debug 写入失败（忽略）：%s", e)
+
+
+def _sanitize_loss_cat(raw) -> str:
+    """Short closed-set phrase → TB tag piece. Long task prompts become empty (dataset bucket only)."""
+    s = str(raw or "").strip()
+    if not s or "\n" in s or len(s) > 80:
+        return ""
+    out = []
+    for ch in s.lower():
+        out.append(ch if (ch.isalnum() or ch in " -_") else "_")
+    s = "_".join("".join(out).split())
+    return s[:64]
+
+
+def _group_detailed_loss(losses, debug_cats, data_config) -> dict:
+    """LingBot detailed_loss: per-sample FM grouped by dataset / subtask. Not a sampling ratio."""
+    out = {}
+    try:
+        repo = ""
+        if isinstance(debug_cats, dict) and debug_cats.get("dataset"):
+            repo = str(debug_cats["dataset"])
+        elif data_config is not None:
+            repo = str(getattr(data_config, "repo_id", "") or "")
+        repo = os.path.basename(str(repo).rstrip("/")) or "dataset"
+        repo = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in repo)[:64] or "dataset"
+        if not isinstance(losses, torch.Tensor) or losses.dim() != 3:
+            return out
+        with torch.no_grad():
+            per = losses.detach().float()
+            d = min(16, per.shape[-1])
+            per = per[..., :d].mean(dim=tuple(range(1, per.ndim))).cpu().numpy()
+        out[repo] = float(per.mean())
+        names = None
+        if isinstance(debug_cats, dict):
+            names = debug_cats.get("subtask") or debug_cats.get("prompt")
+        if not names:
+            return out
+        buckets = {}
+        for i, name in enumerate(list(names)[: len(per)]):
+            tag = _sanitize_loss_cat(name)
+            if not tag:
+                continue
+            buckets.setdefault("subtask/" + tag, []).append(float(per[i]))
+        for k, vs in buckets.items():
+            out[k] = sum(vs) / len(vs)
+    except Exception:
+        return {}
+    return out
+
+
 def load_pytorch_weight_path(model, weight_path: str, device: str | None = None) -> None:
     """Load ``model.safetensors`` from a π0.5 weight dir.
 
@@ -331,6 +910,7 @@ def load_pytorch_weight_path(model, weight_path: str, device: str | None = None)
     """
     raw = _unwrap_model(model)
     model_path = os.path.join(weight_path, "model.safetensors")
+    _assert_base_complete(model_path)
     try:
         if device is not None:
             missing, unexpected = safetensors.torch.load_model(raw, model_path, strict=False, device=device)
@@ -343,6 +923,7 @@ def load_pytorch_weight_path(model, weight_path: str, device: str | None = None)
         )
         if missing:
             logging.warning("Missing weight keys (first 12): %s", list(missing)[:12])
+        _assert_base_complete(model_path, missing)
         if unexpected:
             logging.info("Unexpected weight keys (first 8): %s", list(unexpected)[:8])
         return
@@ -575,6 +1156,16 @@ def train_loop(config: _config.TrainConfig):
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    object.__setattr__(
+        model,
+        "subtask_ce_weight",
+        float(getattr(config.data, "subtask_ce_weight", 1.0) or 1.0),
+    )
+    object.__setattr__(
+        model,
+        "subtask_ce_microbatch",
+        int(getattr(config.data, "subtask_ce_microbatch", 8) or 8),
+    )
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -603,7 +1194,7 @@ def train_loop(config: _config.TrainConfig):
             device_ids=[device.index] if device.type == "cuda" else None,
             find_unused_parameters=True,  # Disable for memory efficiency
             gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
+            static_graph=world_size >= 8 and not bool(getattr(config.data, "subtask_ce", False)),
         )
 
     # Load weights from weight_loader if specified (for fine-tuning)
@@ -730,14 +1321,42 @@ def train_loop(config: _config.TrainConfig):
 
             # Forward pass
             losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
+            fm_loss_v = None
+            ce_loss_v = None
+            if isinstance(losses, dict):
+                loss = losses["loss"]
+                if "fm_loss" in losses:
+                    fm_loss_v = float(losses["fm_loss"].detach())
+                if "ce_loss" in losses:
+                    ce_loss_v = float(losses["ce_loss"].detach())
+            elif isinstance(losses, list | tuple):
                 losses = torch.stack(losses)
+                loss = losses.mean()
             elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+                loss = torch.tensor(losses, device=device, dtype=torch.float32)
+            else:
+                loss = losses.mean()
 
-            loss = losses.mean()
+            # per-joint × per-timestep 探针：不进反传，只取 batch 均值
+            fm_probe = None
+            if isinstance(losses, torch.Tensor) and losses.dim() == 3:
+                with torch.no_grad():
+                    fm_probe = losses.detach().float().mean(dim=0).cpu().numpy()  # [H, D]
+            if fm_probe is not None:
+                _guard_action_dims(
+                    checkpoint_dir=config.checkpoint_dir,
+                    step=global_step,
+                    mat=fm_probe,
+                    scalar_loss=float(loss.detach()),
+                    is_main=is_main,
+                    device=device,
+                )
 
+            cat_losses = _group_detailed_loss(
+                losses if isinstance(losses, torch.Tensor) else None,
+                getattr(loader, "_debug_loss_cats", None),
+                data_config,
+            )
             # Backward pass
             loss.backward()
 
@@ -761,13 +1380,20 @@ def train_loop(config: _config.TrainConfig):
 
             # Collect stats
             if is_main:
-                infos.append(
-                    {
-                        "loss": loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                    }
-                )
+                info = {
+                    "loss": loss.item(),
+                    "learning_rate": optim.param_groups[0]["lr"],
+                    "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                }
+                if fm_loss_v is not None:
+                    info["fm_loss"] = fm_loss_v
+                if ce_loss_v is not None:
+                    info["ce_loss"] = ce_loss_v
+                if fm_probe is not None:
+                    info["fm_probe"] = fm_probe
+                if cat_losses:
+                    info["cat_losses"] = cat_losses
+                infos.append(info)
 
             if is_main and (global_step % config.log_interval == 0) and infos:
                 elapsed = time.time() - start_time
@@ -775,6 +1401,16 @@ def train_loop(config: _config.TrainConfig):
                 # Average stats over log interval
                 avg_loss = sum(info["loss"] for info in infos) / len(infos)
                 avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
+                avg_fm = None
+                avg_ce = None
+                if any("fm_loss" in info for info in infos):
+                    avg_fm = sum(info["fm_loss"] for info in infos if "fm_loss" in info) / max(
+                        1, sum(1 for info in infos if "fm_loss" in info)
+                    )
+                if any("ce_loss" in info for info in infos):
+                    avg_ce = sum(info["ce_loss"] for info in infos if "ce_loss" in info) / max(
+                        1, sum(1 for info in infos if "ce_loss" in info)
+                    )
 
                 avg_grad_norm = None
                 if any("grad_norm" in info for info in infos):
@@ -793,13 +1429,25 @@ def train_loop(config: _config.TrainConfig):
                         epoch=(global_step / steps_per_epoch) if steps_per_epoch else None,
                     )
                 )
-                # Keep a human-readable summary as well.
+                extra = ""
+                if avg_fm is not None and avg_ce is not None:
+                    extra = f" fm={avg_fm:.4f} ce={avg_ce:.4f}"
                 logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
+                    f"step={global_step} loss={avg_loss:.4f}{extra} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
                     if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
+                    else f"step={global_step} loss={avg_loss:.4f}{extra} lr={avg_lr:.2e} time={elapsed:.1f}s"
                 )
 
+                probe_mats = [i["fm_probe"] for i in infos if "fm_probe" in i]
+                if probe_mats:
+                    _write_loss_probe(config.checkpoint_dir, global_step, sum(probe_mats) / len(probe_mats))
+                _write_tb_debug(
+                    checkpoint_dir=config.checkpoint_dir,
+                    step=global_step,
+                    infos=infos,
+                    elapsed=elapsed,
+                    log_interval=config.log_interval,
+                )
                 while loss_steps and loss_steps[-1] >= int(global_step):
                     loss_steps.pop()
                     loss_values.pop()
@@ -848,6 +1496,8 @@ def train_loop(config: _config.TrainConfig):
         logging.info("End of training")
 
     # Finish wandb run
+    if is_main:
+        _close_tb_writer()
     if is_main and config.wandb_enabled:
         wandb.finish()
 
