@@ -38,11 +38,10 @@ ema_decay: 0.99
 pytorch_training_precision: bfloat16
 pytorch_weight_path:
 
-# encoder 已在 TrainConfig 里打开。这里只覆盖 chunk。
-# 不要改回 config_name: pi05_aloha 再加这两个开关——数据进不去。
+# encoder：depth 走 SigLIP（3 通道灰度并入 images），FT 走 Force6DEncoder。
+# 不要改回 use_depth_encoder: true（那是独立 DepthEncoder，不是 PaliGemma SigLIP）。
 model:
   action_horizon: 50
-  # use_depth_encoder / use_force6d_encoder 已由 pi05_aloha_ft_depth 设为 true
 
 lr_schedule:
   warmup_steps: 1000

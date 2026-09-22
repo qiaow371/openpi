@@ -225,14 +225,17 @@ def preprocess_observation(
 
     batch_shape = observation.state.shape[:-1]
 
+    extra_keys = tuple(k for k in observation.images if k not in image_keys)
+    keys_to_process = tuple(image_keys) + extra_keys
+
     out_images = {}
-    for key in image_keys:
+    for key in keys_to_process:
         image = observation.images[key]
         if image.shape[1:3] != image_resolution:
             logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
             image = image_tools.resize_with_pad(image, *image_resolution)
 
-        if train:
+        if train and not str(key).endswith("_depth"):
             # Convert from [-1, 1] to [0, 1] for augmax.
             image = image / 2.0 + 0.5
 

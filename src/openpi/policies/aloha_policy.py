@@ -60,6 +60,42 @@ class ProcessDepths(transforms.DataTransformFn):
         data["depths_mask"] = depth_masks
         return data
 
+
+@dataclasses.dataclass(frozen=True)
+class DepthsAsSiglipImages(transforms.DataTransformFn):
+    """已对齐的 depth → 3 通道图，并入 images，走 SigLIP→Gemma。
+
+    采集侧 ``rs.align`` 之后 depth 已与 RGB 同 HxW，这里只做单通道复制。
+    送到网络前的 224 pad 与 RGB 共用 ``ResizeImages``，那是 SigLIP So400m/14
+    的固定输入尺寸，不是采集时 ``cv2.resize`` 把 320×240 硬拉到 640×480。
+    """
+
+    def __call__(self, data: dict) -> dict:
+        depths = data.get("depths")
+        if not isinstance(depths, dict) or not depths:
+            return data
+
+        images = dict(data.get("images") or {})
+        for key, depth_img in depths.items():
+            arr = np.asarray(depth_img)
+            if arr.dtype == np.uint16:
+                arr = arr.astype(np.float32) / 65535.0
+            else:
+                arr = arr.astype(np.float32)
+            if arr.ndim == 2:
+                arr = arr[..., None]
+            if arr.shape[-1] != 1:
+                arr = arr[..., 0:1]
+            u8 = np.clip(np.round(arr * 255.0), 0, 255).astype(np.uint8)
+            u8 = np.repeat(u8, 3, axis=-1)
+            images[f"{key}_depth"] = u8
+
+        data["images"] = images
+        data["depths"] = {}
+        data["depths_mask"] = {}
+        return data
+
+
 @dataclasses.dataclass(frozen=True)
 class ProcessTactile(transforms.DataTransformFn):
     """通用触觉数据处理（独立组件）

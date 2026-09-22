@@ -287,7 +287,14 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         extra_inputs = []
-        if getattr(model_config, "use_depth_encoder", False):
+        has_sidecar_depth = any(
+            isinstance(t, aloha_policy.LoadSidecarDepthPNGs) for t in self.repack_transforms.inputs
+        )
+        if has_sidecar_depth:
+            # depth 走 SigLIP，不建独立 DepthEncoder
+            extra_inputs.append(aloha_policy.ProcessDepths())
+            extra_inputs.append(aloha_policy.DepthsAsSiglipImages())
+        elif getattr(model_config, "use_depth_encoder", False):
             extra_inputs.append(aloha_policy.ProcessDepths())
         if getattr(model_config, "use_force6d_encoder", False):
             extra_inputs.append(aloha_policy.ProcessForce6D())
@@ -1121,7 +1128,7 @@ _CONFIGS = [
     # DATA_COLLECT cigai20-ft-depth：不要改 pi05_aloha。只开 boolean 不够，必须换 Repack + PNG loader。
     TrainConfig(
         name="pi05_aloha_ft_depth",
-        model=pi0_config.Pi0Config(pi05=True, use_depth_encoder=True, use_force6d_encoder=True),
+        model=pi0_config.Pi0Config(pi05=True, use_depth_encoder=False, use_force6d_encoder=True),
         data=LeRobotAlohaDataConfig(
             repo_id="/home/agilex/dataset-pika_aloha-joint",
             assets=AssetsConfig(

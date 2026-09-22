@@ -2,15 +2,13 @@
 
 从 `tongbot` 拉出，**不改** 现用 RGB-only `pi05_aloha`。
 
-只把 YAML 里 `use_depth_encoder` / `use_force6d_encoder` 改成 true **不够**。还必须：
+Depth **不走** 独立 `DepthEncoder`，也不在采集侧 `cv2.resize`。
+`rs.align` 之后 depth 已与 RGB 同 HxW；训练时复制成 3 通道灰度，并入 `images`，和 RGB 一起进 **SigLIP → Gemma**。
 
-1. 新预设 `pi05_aloha_ft_depth`（两个 encoder 打开）
-2. Repack：`cam_*` RGB + `observation.depths.*` + `observation.force6d.{left,right}`
-3. `LoadSidecarDepthPNGs`（LeRobot 不读旁路 uint16 PNG）
-4. `ProcessDepths` / `ProcessForce6D` 挂进 `LeRobotAlohaDataConfig`
-5. `AlohaInputs` 转发 `depths` / `force6d`
-6. `ResizeDepths(224, 224)`（仅 encoder 打开时）
+SigLIP So400m/14 的输入仍是 **224×224**（`ResizeImages`，`resize_with_pad`）。RGB 本来就是这条；这不是把 320×240 depth 硬拉到 640×480。
 
-数采侧对应 DATA_COLLECT 分支 `cigai20-ft-depth`。
+FT 仍走 `Force6DEncoder`。
+
+还需要：`LoadSidecarDepthPNGs`、cam_* Repack、`AlohaInputs` 转发 force6d。预设名 `pi05_aloha_ft_depth`。
 
 开训前：填 `configs/train_pi05_ft_depth.yaml` 的 `data.repo_id`，跑 `compute_norm_stats.py --config-name pi05_aloha_ft_depth`，并点名服务器。
