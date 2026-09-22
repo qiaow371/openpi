@@ -36,14 +36,14 @@ DEPTH 档会挂 `LoadSidecarDepthPNGs(depth_keys=...)`，只读选中的相机 P
 
 YAML `data.append_modality_prompt` 控制要不要在 **每个额外模态前面** 插 Paligemma 语言 token。**不是**拼进 Task 文本。
 
-开了以后 prefix 类似：
+开了以后 prefix 仍是预训练槽位：三路 RGB → Task+State；DEPTH/FT 接在后面，标签在各自模态前。
 
 ```text
 [RGB head][RGB left][RGB right]
+[Task: pick banana, State: ...; Action:]
 [DEPTH WRIST LEFT][left depth SigLIP tokens]
 [DEPTH WRIST RIGHT][right depth SigLIP tokens]
 [FT LEFT][force6d left][FT RIGHT][force6d right]
-[Task: pick banana, State: ...; Action:]
 ```
 
 | 模态 key | 默认 token |

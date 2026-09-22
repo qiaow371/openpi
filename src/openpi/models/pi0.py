@@ -267,6 +267,26 @@ class Pi0(_model.BaseModel):
         input_mask.append(jnp.ones((batch_size, len(ids_t)), dtype=jnp.bool_))
         ar_mask += [False] * len(ids_t)
 
+    def _embed_image(
+        self,
+        name: str,
+        img,
+        tokens: list,
+        input_mask: list,
+        ar_mask: list,
+        image_masks,
+    ) -> None:
+        image_tokens, _ = self.PaliGemma.img(img, train=False)
+        tokens.append(image_tokens)
+        input_mask.append(
+            einops.repeat(
+                image_masks[name],
+                "b -> b s",
+                s=image_tokens.shape[1],
+            )
+        )
+        ar_mask += [False] * image_tokens.shape[1]
+
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation
@@ -274,33 +294,36 @@ class Pi0(_model.BaseModel):
         input_mask = []
         ar_mask = []
         tokens = []
+        pretrained_rgb = set(_model.IMAGE_KEYS)
 
-        # 1) embed RGB / extra SigLIP images. Optional language tag immediately before each extra modality.
+        # Pretrained slot 1: three RGB views, no extra tags.
+        for name in _model.IMAGE_KEYS:
+            if name not in obs.images:
+                continue
+            self._embed_image(name, obs.images[name], tokens, input_mask, ar_mask, obs.image_masks)
+
+        # Pretrained slot 2: Task + discretized State language tokens.
+        if obs.tokenized_prompt is not None:
+            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+            tokens.append(tokenized_inputs)
+            input_mask.append(obs.tokenized_prompt_mask)
+            ar_mask += [False] * tokenized_inputs.shape[1]
+
+        # Extra SigLIP images (aligned depth copied into images as *_depth). Tag immediately before each.
         for name, img in obs.images.items():
+            if name in pretrained_rgb:
+                continue
             self._append_modality_prompt(name, img.shape[0], tokens, input_mask, ar_mask)
-            image_tokens, _ = self.PaliGemma.img(img, train=False)
+            self._embed_image(name, img, tokens, input_mask, ar_mask, obs.image_masks)
 
-            tokens.append(image_tokens)
-            input_mask.append(
-                einops.repeat(
-                    obs.image_masks[name],
-                    "b -> b s",
-                    s=image_tokens.shape[1],
-                )
-            )
-            # image tokens attend to each other
-            ar_mask += [False] * image_tokens.shape[1]
-
-        # 2) embed depth images (only from obs.depths, not from images)
+        # Independent DepthEncoder path (not used by TongBot SigLIP depth presets).
         if self.depth_encoder is not None:
             if obs.depths is not None and obs.depths_masks is not None:
-                # 如果 depth_image_keys 为空或未指定，使用所有 depths 中的键
                 depth_keys = getattr(self.config, "depth_image_keys", None)
                 if depth_keys is None or len(depth_keys) == 0:
                     depth_keys = obs.depths.keys()
-                
+
                 for name, depth_img in obs.depths.items():
-                    # 只使用指定的深度图（如果 depth_image_keys 为空则使用全部）
                     if name not in depth_keys:
                         continue
                     self._append_modality_prompt(name, depth_img.shape[0], tokens, input_mask, ar_mask)
@@ -316,19 +339,15 @@ class Pi0(_model.BaseModel):
                     )
                     ar_mask += [False] * depth_tokens.shape[1]
 
-        # embed tactile data (as a separate observation modality, like images)
         if self.tactile_encoder is not None and obs.tactile_force3d is not None:
             for tactile_key, tactile_data in obs.tactile_force3d.items():
-                # tactile_data shape: [B, H, W, C]
-                tactile_tokens = self.tactile_encoder(tactile_data, train=False)  # [B, num_tokens, output_dim]
-                
+                tactile_tokens = self.tactile_encoder(tactile_data, train=False)
+
                 tokens.append(tactile_tokens)
-                # Get tactile mask (default to True if not provided)
                 tactile_mask = obs.tactile_masks.get(tactile_key, None) if obs.tactile_masks is not None else None
                 if tactile_mask is None:
-                    # Default to all True if mask not provided
                     tactile_mask = jnp.ones((tactile_tokens.shape[0],), dtype=jnp.bool_)
-                
+
                 input_mask.append(
                     einops.repeat(
                         tactile_mask,
@@ -336,29 +355,22 @@ class Pi0(_model.BaseModel):
                         s=tactile_tokens.shape[1],
                     )
                 )
-                # tactile tokens attend to each other and to images/language
                 ar_mask += [False] * tactile_tokens.shape[1]
-        
-        # embed force6d data (as a separate observation modality, like tactile data)
-        # In pi05 mode: processed here as observation tokens
-        # In non-pi05 mode: processed in embed_suffix and concatenated to state embedding
+
+        # π0.5: force6d as extra prefix tokens after pretrained RGB+language.
         if self.force6d_encoder is not None and obs.force6d is not None:
             for force6d_key, force6d_vec in obs.force6d.items():
-                # force6d_vec shape: [B, 6]
-                # Encode to [B, emb_dim], then add token dimension: [B, 1, emb_dim]
                 self._append_modality_prompt(
                     f"force6d.{force6d_key}", force6d_vec.shape[0], tokens, input_mask, ar_mask
                 )
-                encoded_force6d = self.force6d_encoder(force6d_vec, train=False)  # [B, emb_dim]
-                force6d_tokens = encoded_force6d[:, None, :]  # [B, 1, emb_dim]
-                
+                encoded_force6d = self.force6d_encoder(force6d_vec, train=False)
+                force6d_tokens = encoded_force6d[:, None, :]
+
                 tokens.append(force6d_tokens)
-                # Get force6d mask (default to True if not provided)
                 force6d_mask = obs.force6d_masks.get(force6d_key, None) if obs.force6d_masks is not None else None
                 if force6d_mask is None:
-                    # Default to all True if mask not provided
                     force6d_mask = jnp.ones((force6d_tokens.shape[0],), dtype=jnp.bool_)
-                
+
                 input_mask.append(
                     einops.repeat(
                         force6d_mask,
@@ -366,16 +378,8 @@ class Pi0(_model.BaseModel):
                         s=force6d_tokens.shape[1],
                     )
                 )
-                # force6d tokens attend to each other and to images/language/tactile
                 ar_mask += [False] * force6d_tokens.shape[1]
-        
-        # add language (aka tokenized inputs)
-        if obs.tokenized_prompt is not None:
-            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
-            tokens.append(tokenized_inputs)
-            input_mask.append(obs.tokenized_prompt_mask)
-            # full attention between image and language inputs
-            ar_mask += [False] * tokenized_inputs.shape[1]
+
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
