@@ -57,6 +57,6 @@ data:
   prompt_from_subtask: false
   append_modality_prompt: true
   modality_prompt_tags:
-    cam_left_depth: "DEPTH WRIST LEFT"
+    cam_left_depth: "DEPTH WRIST LEFT: "
   adapt_to_pi: false
   delta_action_dims: [7, 7, -1, -1]

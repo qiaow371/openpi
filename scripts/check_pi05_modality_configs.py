@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+import dataclasses
+
+import numpy as np
+
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.training.config as config
 import openpi.transforms as transforms
@@ -13,34 +17,34 @@ EXPECTED = {
         "depth": "head",
         "ft": False,
         "keys": ("observation.depths.cam_mid",),
-        "tags": {"cam_mid_depth": "DEPTH HEAD"},
+        "tags": {"cam_mid_depth": "DEPTH HEAD: "},
     },
     "pi05_aloha_rgb_depth_left": {
         "depth": "left",
         "ft": False,
         "keys": ("observation.depths.cam_left",),
-        "tags": {"cam_left_depth": "DEPTH WRIST LEFT"},
+        "tags": {"cam_left_depth": "DEPTH WRIST LEFT: "},
     },
     "pi05_aloha_rgb_depth_right": {
         "depth": "right",
         "ft": False,
         "keys": ("observation.depths.cam_right",),
-        "tags": {"cam_right_depth": "DEPTH WRIST RIGHT"},
+        "tags": {"cam_right_depth": "DEPTH WRIST RIGHT: "},
     },
     "pi05_aloha_rgb_ft": {
         "depth": "none",
         "ft": True,
         "keys": (),
-        "tags": {"force6d.left": "FT LEFT", "force6d.right": "FT RIGHT"},
+        "tags": {"force6d.left": "FT LEFT: ", "force6d.right": "FT RIGHT: "},
     },
     "pi05_aloha_rgb_depth_head_ft": {
         "depth": "head",
         "ft": True,
         "keys": ("observation.depths.cam_mid",),
         "tags": {
-            "cam_mid_depth": "DEPTH HEAD",
-            "force6d.left": "FT LEFT",
-            "force6d.right": "FT RIGHT",
+            "cam_mid_depth": "DEPTH HEAD: ",
+            "force6d.left": "FT LEFT: ",
+            "force6d.right": "FT RIGHT: ",
         },
     },
     "pi05_aloha_rgb_depth_left_ft": {
@@ -48,9 +52,9 @@ EXPECTED = {
         "ft": True,
         "keys": ("observation.depths.cam_left",),
         "tags": {
-            "cam_left_depth": "DEPTH WRIST LEFT",
-            "force6d.left": "FT LEFT",
-            "force6d.right": "FT RIGHT",
+            "cam_left_depth": "DEPTH WRIST LEFT: ",
+            "force6d.left": "FT LEFT: ",
+            "force6d.right": "FT RIGHT: ",
         },
     },
     "pi05_aloha_rgb_depth_right_ft": {
@@ -58,9 +62,9 @@ EXPECTED = {
         "ft": True,
         "keys": ("observation.depths.cam_right",),
         "tags": {
-            "cam_right_depth": "DEPTH WRIST RIGHT",
-            "force6d.left": "FT LEFT",
-            "force6d.right": "FT RIGHT",
+            "cam_right_depth": "DEPTH WRIST RIGHT: ",
+            "force6d.left": "FT LEFT: ",
+            "force6d.right": "FT RIGHT: ",
         },
     },
 }
@@ -120,28 +124,28 @@ def main() -> None:
     yaml_dir = pathlib.Path(__file__).resolve().parent.parent / "configs"
     yaml_expected = {
         "train_pi05_rgb.yaml": (False, {}),
-        "train_pi05_rgb_depth_head.yaml": (True, {"cam_mid_depth": "DEPTH HEAD"}),
-        "train_pi05_rgb_depth_left.yaml": (True, {"cam_left_depth": "DEPTH WRIST LEFT"}),
-        "train_pi05_rgb_depth_right.yaml": (True, {"cam_right_depth": "DEPTH WRIST RIGHT"}),
-        "train_pi05_rgb_ft.yaml": (True, {"force6d.left": "FT LEFT", "force6d.right": "FT RIGHT"}),
+        "train_pi05_rgb_depth_head.yaml": (True, {"cam_mid_depth": "DEPTH HEAD: "}),
+        "train_pi05_rgb_depth_left.yaml": (True, {"cam_left_depth": "DEPTH WRIST LEFT: "}),
+        "train_pi05_rgb_depth_right.yaml": (True, {"cam_right_depth": "DEPTH WRIST RIGHT: "}),
+        "train_pi05_rgb_ft.yaml": (True, {"force6d.left": "FT LEFT: ", "force6d.right": "FT RIGHT: "}),
         "train_pi05_rgb_depth_head_ft.yaml": (
             True,
-            {"cam_mid_depth": "DEPTH HEAD", "force6d.left": "FT LEFT", "force6d.right": "FT RIGHT"},
+            {"cam_mid_depth": "DEPTH HEAD: ", "force6d.left": "FT LEFT: ", "force6d.right": "FT RIGHT: "},
         ),
         "train_pi05_rgb_depth_left_ft.yaml": (
             True,
             {
-                "cam_left_depth": "DEPTH WRIST LEFT",
-                "force6d.left": "FT LEFT",
-                "force6d.right": "FT RIGHT",
+                "cam_left_depth": "DEPTH WRIST LEFT: ",
+                "force6d.left": "FT LEFT: ",
+                "force6d.right": "FT RIGHT: ",
             },
         ),
         "train_pi05_rgb_depth_right_ft.yaml": (
             True,
             {
-                "cam_right_depth": "DEPTH WRIST RIGHT",
-                "force6d.left": "FT LEFT",
-                "force6d.right": "FT RIGHT",
+                "cam_right_depth": "DEPTH WRIST RIGHT: ",
+                "force6d.left": "FT LEFT: ",
+                "force6d.right": "FT RIGHT: ",
             },
         ),
     }
@@ -152,7 +156,110 @@ def main() -> None:
         assert dict(data.get("modality_prompt_tags") or {}) == tags, fname
         print(f"ok  yaml {fname}")
 
+    _smoke_all_option_transforms()
     print("all 8 modality presets ok")
+
+
+def _write_uint16_png(path, value: int = 1200) -> None:
+    import cv2
+    import numpy as np
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img = np.full((8, 8), value, dtype=np.uint16)
+    assert cv2.imwrite(str(path), img)
+
+
+def _fake_sample(root, *, use_underscore: bool = True) -> dict:
+    import numpy as np
+
+    rgb = np.zeros((8, 8, 3), dtype=np.uint8)
+    rgb[..., 1] = 40
+    sample = {
+        "observation.images.cam_mid": rgb.copy(),
+        "observation.images.cam_left": rgb.copy(),
+        "observation.images.cam_right": rgb.copy(),
+        "observation.state": np.zeros(16, dtype=np.float32),
+        "action": np.zeros(16, dtype=np.float32),
+        "observation.force6d.left": np.array([1, 0, 5, 0, 0, 0], dtype=np.float32),
+        "observation.force6d.right": np.array([0, 1, 8, 0, 0, 0], dtype=np.float32),
+        "episode_index": np.array(0),
+        "frame_index": np.array(0),
+        "prompt": "pick banana",
+    }
+    name = "frame_000000.png" if use_underscore else "frame-000000.png"
+    for cam in ("cam_left", "cam_mid", "cam_right"):
+        key = f"observation.depths.{cam}"
+        _write_uint16_png(
+            root / "depth" / key / "chunk-000" / "episode-000000" / name,
+            1500,
+        )
+    return sample
+
+
+def _apply_option(cfg: config.TrainConfig, sample: dict, dataset_root: str) -> dict:
+    import copy
+
+    data = copy.deepcopy(sample)
+    for t in cfg.data.repack_transforms.inputs:
+        if isinstance(t, aloha_policy.LoadSidecarDepthPNGs):
+            t = dataclasses.replace(t, dataset_root=dataset_root)
+        data = t(data)
+    extra = []
+    if any(isinstance(t, aloha_policy.LoadSidecarDepthPNGs) for t in cfg.data.repack_transforms.inputs):
+        extra.extend([aloha_policy.ProcessDepths(), aloha_policy.DepthsAsSiglipImages()])
+    if cfg.model.use_force6d_encoder:
+        extra.append(aloha_policy.ProcessForce6D())
+    extra.append(aloha_policy.AlohaInputs(adapt_to_pi=False))
+    for t in extra:
+        data = t(data)
+    return data
+
+
+def _smoke_all_option_transforms() -> None:
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "meta").mkdir()
+        (root / "meta" / "info.json").write_text('{"chunks_size": 1000, "features": {}}', encoding="utf-8")
+        sample = _fake_sample(root, use_underscore=True)
+        for name, spec in EXPECTED.items():
+            cfg = config.get_config(name)
+            out = _apply_option(cfg, sample, str(root))
+            images = out["image"]
+            assert set(aloha_policy.AlohaInputs.STANDARD_IMAGE_KEYS).issubset(images), name
+            depth_keys = {f"{cam}_depth" for cam in ("cam_left", "cam_mid", "cam_right")}
+            present = set(images) & depth_keys
+            if spec["depth"] == "none":
+                assert not present, (name, present)
+            elif spec["depth"] == "head":
+                assert present == {"cam_mid_depth"}, (name, present)
+            elif spec["depth"] == "left":
+                assert present == {"cam_left_depth"}, (name, present)
+            else:
+                assert present == {"cam_right_depth"}, (name, present)
+            if spec["ft"]:
+                assert "force6d" in out and set(out["force6d"]) == {"left", "right"}, name
+                assert bool(out["force6d_mask"]["left"]) is True, name
+            else:
+                assert "force6d" not in out, name
+            print(f"ok  transform {name}")
+
+        import shutil
+
+        shutil.rmtree(root / "depth")
+        hyphen = _fake_sample(root, use_underscore=False)
+        out = _apply_option(config.get_config("pi05_aloha_rgb_depth_head"), hyphen, str(root))
+        assert "cam_mid_depth" in out["image"]
+        print("ok  transform depth filename hyphen")
+
+        nan_sample = _fake_sample(root, use_underscore=False)
+        nan_sample["observation.force6d.left"] = np.array([np.nan] * 6, dtype=np.float32)
+        out = _apply_option(config.get_config("pi05_aloha_rgb_ft"), nan_sample, str(root))
+        assert bool(out["force6d_mask"]["left"]) is False
+        assert bool(out["force6d_mask"]["right"]) is True
+        print("ok  transform ft nan mask")
 
 
 if __name__ == "__main__":

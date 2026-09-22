@@ -48,7 +48,7 @@ class PaligemmaTokenizer:
         return np.asarray(tokens), np.asarray(mask)
 
     def encode_fragment(self, text: str) -> np.ndarray:
-        """Encode a mid-sequence label (e.g. ``DEPTH WRIST LEFT``) without BOS or Task wrapper."""
+        """Encode a mid-sequence label (e.g. ``DEPTH WRIST LEFT: ``) without BOS or Task wrapper."""
         cleaned = text.strip().replace("_", " ").replace("\n", " ")
         if not cleaned:
             return np.asarray([], dtype=np.int32)

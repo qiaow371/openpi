@@ -57,8 +57,8 @@ data:
   prompt_from_subtask: false
   append_modality_prompt: true
   modality_prompt_tags:
-    cam_right_depth: "DEPTH WRIST RIGHT"
-    force6d.left: "FT LEFT"
-    force6d.right: "FT RIGHT"
+    cam_right_depth: "DEPTH WRIST RIGHT: "
+    force6d.left: "FT LEFT: "
+    force6d.right: "FT RIGHT: "
   adapt_to_pi: false
   delta_action_dims: [7, 7, -1, -1]

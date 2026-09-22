@@ -262,7 +262,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     # YAML: data.append_modality_prompt: true
     # 在 prefix 里、每个 DEPTH/FT 模态的 token 前面插入对应语言 token（不是拼进 Task）。
     append_modality_prompt: bool = False
-    # YAML: data.modality_prompt_tags: {cam_left_depth: "DEPTH WRIST LEFT"}
+    # YAML: data.modality_prompt_tags: {cam_left_depth: "DEPTH WRIST LEFT: "}
     modality_prompt_tags: dict[str, str] = dataclasses.field(default_factory=dict)
     # If true, this will convert the joint and gripper values from the standard Aloha space to
     # the space used by the pi internal runtime which was used to train the base model. People who
@@ -769,13 +769,13 @@ _TONGBOT_FORCE6D = {
 }
 _TONGBOT_PROMPT_TAGS_BY_DEPTH: dict[str, dict[str, str]] = {
     "none": {},
-    "head": {"cam_mid_depth": "DEPTH HEAD"},
-    "left": {"cam_left_depth": "DEPTH WRIST LEFT"},
-    "right": {"cam_right_depth": "DEPTH WRIST RIGHT"},
+    "head": {"cam_mid_depth": "DEPTH HEAD: "},
+    "left": {"cam_left_depth": "DEPTH WRIST LEFT: "},
+    "right": {"cam_right_depth": "DEPTH WRIST RIGHT: "},
 }
 _TONGBOT_PROMPT_TAGS_FT: dict[str, str] = {
-    "force6d.left": "FT LEFT",
-    "force6d.right": "FT RIGHT",
+    "force6d.left": "FT LEFT: ",
+    "force6d.right": "FT RIGHT: ",
 }
 
 

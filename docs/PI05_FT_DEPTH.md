@@ -35,6 +35,28 @@ DEPTH 档会挂 `LoadSidecarDepthPNGs(depth_keys=...)`，只读选中的相机 P
 
 动作维是 TongBot 16D：`delta_action_dims: [7, 7, -1, -1]`（左7 | 右7 | 左爪 abs | 右爪 abs）。
 
+## 预训练槽位是什么
+
+π0.5 基座（`pi05_base`）prefix 只有两类槽，没有 DEPTH / FT：
+
+| 槽 | 内容 | 长度 | 怎么对齐 |
+|---|---|---|---|
+| 图 1 | `base_0_rgb`（头/胸口，映射 `cam_mid`） | SigLIP So400m/14，224÷14=16 → **256** patch | 预训练三路相机之一 |
+| 图 2 | `left_wrist_0_rgb`（`cam_left`） | 同上 256 | 同上 |
+| 图 3 | `right_wrist_0_rgb`（`cam_right`） | 同上 256 | 同上 |
+| 语言 | **一整段** Paligemma 文本，不是三个独立槽 | pad 到 `max_token_len=200` | 预训练语言模板 |
+
+语言模板就是：
+
+```text
+Task: {指令}, State: {每维 0–255 的整数};
+Action: 
+```
+
+`Task:` / `State:` / `Action:` 都是**同一段字符串里的字段标签**（冒号+空格），不是单独的特殊 token 类型。State 数字在这段里；Action 只有 cue，真动作在 suffix 的 50 个连续 token。
+
+DEPTH / FT **没有**预训练槽。它们插在三路 RGB 和这段语言之间；标签写成同样的 `...: ` 形式，例如 `DEPTH WRIST LEFT: `。
+
 ## 语言 token（DEPTH / FT 标签）
 
 YAML `data.append_modality_prompt` 控制要不要在 **DEPTH / FT 前面** 插 Paligemma 语言 token。RGB 已经和预训练三路相机对齐，**不加**标签，也不改 Task 文本。
@@ -42,19 +64,20 @@ YAML `data.append_modality_prompt` 控制要不要在 **DEPTH / FT 前面** 插 
 开了以后 prefix：
 
 ```text
-[RGB head][RGB left][RGB right]                 # 预训练槽，无标签
-[DEPTH WRIST LEFT][这一路 depth]                 # 可选；HEAD/LEFT/RIGHT 三选一
-[FT LEFT][左力][FT RIGHT][右力]                   # 可选
-[Task: pick banana, State: ...; Action:]
+[RGB head][RGB left][RGB right]                 # 预训练图槽，无标签
+[DEPTH WRIST LEFT: ][这一路 depth]               # 可选；HEAD/LEFT/RIGHT 三选一
+[FT LEFT: ][左力][FT RIGHT: ][右力]               # 可选
+[Task: pick banana, State: ...;
+Action: ]
 ```
 
 | 模态 key | 默认 token |
 |---|---|
-| `cam_mid_depth` | `DEPTH HEAD` |
-| `cam_left_depth` | `DEPTH WRIST LEFT` |
-| `cam_right_depth` | `DEPTH WRIST RIGHT` |
-| `force6d.left` | `FT LEFT` |
-| `force6d.right` | `FT RIGHT` |
+| `cam_mid_depth` | `DEPTH HEAD: ` |
+| `cam_left_depth` | `DEPTH WRIST LEFT: ` |
+| `cam_right_depth` | `DEPTH WRIST RIGHT: ` |
+| `force6d.left` | `FT LEFT: ` |
+| `force6d.right` | `FT RIGHT: ` |
 
 DEPTH/FT 档 YAML 默认 `true`；只训 RGB 为 `false`。关掉则只加图 / Force6DEncoder。文案改 `data.modality_prompt_tags` 的 dict。tokenizer 会把 `_` 换成空格，标签请用空格。
 
