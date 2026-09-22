@@ -31,20 +31,21 @@ SigLIP So400m/14 的输入仍是 **224×224**（`ResizeImages`，`resize_with_pa
 FT 仍走 `Force6DEncoder`。RGB-only / RGB+DEPTH 预设把 `use_force6d_encoder=False`，Repack 也不带 `force6d`。
 
 DEPTH 档会挂 `LoadSidecarDepthPNGs(depth_keys=...)`，只读选中的相机 PNG，不会把三路都扫进来。
+现场盘文件名是 `frame_000000.png`，`meta.json` 模板是 `frame-000000.png`；loader **两种都认**。uint16 毫米按 0–4 m 拉到 8-bit 再进 SigLIP（不要 /65535，否则几乎全黑）。FT 若出现 NaN 会 mask 掉，不让 NaN 进 `Force6DEncoder`。
 
 动作维是 TongBot 16D：`delta_action_dims: [7, 7, -1, -1]`（左7 | 右7 | 左爪 abs | 右爪 abs）。
 
 ## 语言 token（DEPTH / FT 标签）
 
-YAML `data.append_modality_prompt` 控制要不要在 **每个额外模态前面** 插 Paligemma 语言 token。**不是**拼进 Task 文本。
+YAML `data.append_modality_prompt` 控制要不要在 **DEPTH / FT 前面** 插 Paligemma 语言 token。RGB 已经和预训练三路相机对齐，**不加**标签，也不改 Task 文本。
 
-开了以后 prefix 仍是预训练槽位：三路 RGB → Task+State；DEPTH/FT 接在后面，标签在各自模态前。
+开了以后 prefix：
 
 ```text
-[RGB head][RGB left][RGB right]
+[RGB head][RGB left][RGB right]                 # 预训练槽，无标签
+[DEPTH WRIST LEFT][这一路 depth]                 # 可选；HEAD/LEFT/RIGHT 三选一
+[FT LEFT][左力][FT RIGHT][右力]                   # 可选
 [Task: pick banana, State: ...; Action:]
-[DEPTH WRIST LEFT][left depth SigLIP tokens]   # 仅 left 档；head/right 各只插一路
-[FT LEFT][force6d left][FT RIGHT][force6d right]
 ```
 
 | 模态 key | 默认 token |

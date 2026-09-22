@@ -845,7 +845,7 @@ def _tongbot_modality_train_config(
             use_delta_joint_actions=True,
             # TongBot 16D: 左7 | 右7 | 左爪 abs | 右爪 abs
             delta_action_dims=(7, 7, -1, -1),
-            # YAML data.append_modality_prompt: true 才在每个模态前插入语言 token。
+            # YAML data.append_modality_prompt: true 才在 DEPTH/FT 前插入语言 token（RGB 不加）。
             append_modality_prompt=False,
             modality_prompt_tags=tag_map,
             repack_transforms=_tongbot_modality_repack(depth=depth, use_ft=use_ft),

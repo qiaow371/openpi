@@ -296,20 +296,13 @@ class Pi0(_model.BaseModel):
         tokens = []
         pretrained_rgb = set(_model.IMAGE_KEYS)
 
-        # Pretrained slot 1: three RGB views, no extra tags.
+        # Pretrained RGB views only. No DEPTH/FT tags here — those cameras already match the base slot.
         for name in _model.IMAGE_KEYS:
             if name not in obs.images:
                 continue
             self._embed_image(name, obs.images[name], tokens, input_mask, ar_mask, obs.image_masks)
 
-        # Pretrained slot 2: Task + discretized State language tokens.
-        if obs.tokenized_prompt is not None:
-            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
-            tokens.append(tokenized_inputs)
-            input_mask.append(obs.tokenized_prompt_mask)
-            ar_mask += [False] * tokenized_inputs.shape[1]
-
-        # Extra SigLIP images (aligned depth copied into images as *_depth). Tag immediately before each.
+        # Extra DEPTH (SigLIP copies as *_depth). Optional tag immediately before each extra view.
         for name, img in obs.images.items():
             if name in pretrained_rgb:
                 continue
@@ -357,7 +350,7 @@ class Pi0(_model.BaseModel):
                 )
                 ar_mask += [False] * tactile_tokens.shape[1]
 
-        # π0.5: force6d as extra prefix tokens after pretrained RGB+language.
+        # π0.5: force6d after RGB (+ optional DEPTH), still before Task language.
         if self.force6d_encoder is not None and obs.force6d is not None:
             for force6d_key, force6d_vec in obs.force6d.items():
                 self._append_modality_prompt(
@@ -379,6 +372,13 @@ class Pi0(_model.BaseModel):
                     )
                 )
                 ar_mask += [False] * force6d_tokens.shape[1]
+
+        # Task + discretized State + "Action:" cue. Unchanged pretrained language string.
+        if obs.tokenized_prompt is not None:
+            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+            tokens.append(tokenized_inputs)
+            input_mask.append(obs.tokenized_prompt_mask)
+            ar_mask += [False] * tokenized_inputs.shape[1]
 
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
