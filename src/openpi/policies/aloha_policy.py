@@ -198,6 +198,58 @@ class ProcessForce6D(transforms.DataTransformFn):
         return data
 
 
+_SIDECAR_DEPTH_KEY_CACHE: dict[str, tuple[str, ...]] = {}
+
+
+@dataclasses.dataclass(frozen=True)
+class LoadSidecarDepthPNGs(transforms.DataTransformFn):
+    """把 DATA_COLLECT 的外部 uint16 depth PNG 填进 LeRobot sample。
+
+    标准 LeRobotDataset 不读 info.json 里 dtype=depth 的旁路文件。
+    必须在 RepackTransform 之前跑：写出 observation.depths.* 后才能被 Repack 映射。
+    LeRobotAlohaDataConfig.create() 会用 data.repo_id 覆盖 dataset_root。
+    """
+
+    dataset_root: str
+    prefix: str = "observation.depths"
+    chunks_size: int = 1000
+    depth_keys: tuple[str, ...] = ()
+
+    def __call__(self, data: dict) -> dict:
+        import json
+        from pathlib import Path
+
+        root = Path(self.dataset_root)
+        keys = self.depth_keys
+        if not keys:
+            cache_key = f"{root}:{self.prefix}"
+            keys = _SIDECAR_DEPTH_KEY_CACHE.get(cache_key)
+            if keys is None:
+                info_path = root / "meta" / "info.json"
+                features = json.loads(info_path.read_text(encoding="utf-8")).get("features", {})
+                keys = tuple(k for k in features if str(k).startswith(self.prefix + "."))
+                _SIDECAR_DEPTH_KEY_CACHE[cache_key] = keys
+        ep = int(np.asarray(data["episode_index"]).reshape(-1)[0])
+        fr = int(np.asarray(data["frame_index"]).reshape(-1)[0])
+        chunk = ep // int(self.chunks_size)
+        for key in keys:
+            if data.get(key) is not None:
+                continue
+            path = (
+                root
+                / "depth"
+                / key
+                / f"chunk-{chunk:03d}"
+                / f"episode-{ep:06d}"
+                / f"frame-{fr:06d}.png"
+            )
+            img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise FileNotFoundError(f"depth PNG missing: {path}")
+            data[key] = img
+        return data
+
+
 # ============================================================================
 # 向后兼容的别名
 # ============================================================================
@@ -296,6 +348,21 @@ class AlohaInputs(transforms.DataTransformFn):
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
+
+        # π0.5 多模态：Repack + ProcessDepths/ProcessForce6D 之后必须原样转发，
+        # 否则 Observation.from_dict 看不到 depths / force6d。
+        for extra in (
+            "depths",
+            "depths_mask",
+            "force6d",
+            "force6d_mask",
+            "tactile",
+            "tactile_mask",
+            "tactile_force3d",
+            "tactile_force3d_mask",
+        ):
+            if extra in data:
+                inputs[extra] = data[extra]
 
         return inputs
 

@@ -130,17 +130,22 @@ class ModelTransformFactory(GroupFactory):
                 )
             case _model.ModelType.PI05:
                 assert isinstance(model_config, pi0_config.Pi0Config)
-                return _transforms.Group(
-                    inputs=[
-                        _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
+                pi05_inputs = [
+                    _transforms.InjectDefaultPrompt(self.default_prompt),
+                    _transforms.ResizeImages(224, 224),
+                ]
+                if getattr(model_config, "use_depth_encoder", False):
+                    pi05_inputs.append(_transforms.ResizeDepths(224, 224))
+                pi05_inputs.extend(
+                    [
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
-                    ],
+                    ]
                 )
+                return _transforms.Group(inputs=pi05_inputs)
             case _model.ModelType.PI0_FAST:
                 tokenizer_cls = (
                     _tokenizer.FASTTokenizer
@@ -281,8 +286,13 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        extra_inputs = []
+        if getattr(model_config, "use_depth_encoder", False):
+            extra_inputs.append(aloha_policy.ProcessDepths())
+        if getattr(model_config, "use_force6d_encoder", False):
+            extra_inputs.append(aloha_policy.ProcessForce6D())
         data_transforms = _transforms.Group(
-            inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi)],
+            inputs=[*extra_inputs, aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi)],
             outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
         )
         if self.use_delta_joint_actions:
@@ -296,9 +306,21 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
+        repack_transforms = self.repack_transforms
+        if self.repo_id is not tyro.MISSING and self.repo_id:
+            patched = []
+            changed = False
+            for t in repack_transforms.inputs:
+                if isinstance(t, aloha_policy.LoadSidecarDepthPNGs):
+                    t = dataclasses.replace(t, dataset_root=str(self.repo_id))
+                    changed = True
+                patched.append(t)
+            if changed:
+                repack_transforms = dataclasses.replace(repack_transforms, inputs=tuple(patched))
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
-            repack_transforms=self.repack_transforms,
+            repack_transforms=repack_transforms,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
@@ -1089,6 +1111,52 @@ _CONFIGS = [
                             "actions": "action",
                         }
                     )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80000,
+        batch_size=16,
+    ),
+    # DATA_COLLECT cigai20-ft-depth：不要改 pi05_aloha。只开 boolean 不够，必须换 Repack + PNG loader。
+    TrainConfig(
+        name="pi05_aloha_ft_depth",
+        model=pi0_config.Pi0Config(pi05=True, use_depth_encoder=True, use_force6d_encoder=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="/home/agilex/dataset-pika_aloha-joint",
+            assets=AssetsConfig(
+                assets_dir="/home/agilex/dataset-pika_aloha-joint",
+                asset_id=".",
+            ),
+            default_prompt="null",
+            adapt_to_pi=False,
+            use_delta_joint_actions=True,
+            delta_action_dims=(7, -1, 7, -1),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    aloha_policy.LoadSidecarDepthPNGs(
+                        dataset_root="/home/agilex/dataset-pika_aloha-joint",
+                    ),
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "base_0_rgb": "observation.images.cam_mid",
+                                "left_wrist_0_rgb": "observation.images.cam_left",
+                                "right_wrist_0_rgb": "observation.images.cam_right",
+                            },
+                            "depths": {
+                                "cam_left": "observation.depths.cam_left",
+                                "cam_mid": "observation.depths.cam_mid",
+                                "cam_right": "observation.depths.cam_right",
+                            },
+                            "force6d": {
+                                "left": "observation.force6d.left",
+                                "right": "observation.force6d.right",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    ),
                 ]
             ),
         ),
