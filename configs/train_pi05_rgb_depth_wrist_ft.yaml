@@ -55,5 +55,7 @@ data:
   default_prompt: "REPLACE_ME"
   prompt_from_task: true
   prompt_from_subtask: false
+  append_modality_prompt: true
+  modality_prompt_tags: ["DEPTH WRIST LEFT", "DEPTH WRIST RIGHT", "FT LEFT", "FT RIGHT"]
   adapt_to_pi: false
   delta_action_dims: [7, 7, -1, -1]

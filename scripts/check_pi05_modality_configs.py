@@ -8,27 +8,36 @@ import openpi.training.config as config
 import openpi.transforms as transforms
 
 EXPECTED = {
-    "pi05_aloha_rgb": {"depth": "none", "ft": False, "keys": ()},
+    "pi05_aloha_rgb": {"depth": "none", "ft": False, "keys": (), "tags": ()},
     "pi05_aloha_rgb_depth_head": {
         "depth": "head",
         "ft": False,
         "keys": ("observation.depths.cam_mid",),
+        "tags": ("DEPTH HEAD",),
     },
     "pi05_aloha_rgb_depth_wrist": {
         "depth": "wrist",
         "ft": False,
         "keys": ("observation.depths.cam_left", "observation.depths.cam_right"),
+        "tags": ("DEPTH WRIST LEFT", "DEPTH WRIST RIGHT"),
     },
-    "pi05_aloha_rgb_ft": {"depth": "none", "ft": True, "keys": ()},
+    "pi05_aloha_rgb_ft": {
+        "depth": "none",
+        "ft": True,
+        "keys": (),
+        "tags": ("FT LEFT", "FT RIGHT"),
+    },
     "pi05_aloha_rgb_depth_head_ft": {
         "depth": "head",
         "ft": True,
         "keys": ("observation.depths.cam_mid",),
+        "tags": ("DEPTH HEAD", "FT LEFT", "FT RIGHT"),
     },
     "pi05_aloha_rgb_depth_wrist_ft": {
         "depth": "wrist",
         "ft": True,
         "keys": ("observation.depths.cam_left", "observation.depths.cam_right"),
+        "tags": ("DEPTH WRIST LEFT", "DEPTH WRIST RIGHT", "FT LEFT", "FT RIGHT"),
     },
 }
 
@@ -75,7 +84,41 @@ def main() -> None:
             }, name
         else:
             assert "force6d" not in structure, name
-        print(f"ok  {name:32s}  depth={spec['depth']:5s}  ft={spec['ft']}")
+        assert tuple(cfg.data.modality_prompt_tags) == spec["tags"], (
+            name,
+            cfg.data.modality_prompt_tags,
+        )
+        assert cfg.data.append_modality_prompt is False, name
+        print(f"ok  {name:32s}  depth={spec['depth']:5s}  ft={spec['ft']}  tags={spec['tags']}")
+    tagged = aloha_policy.AppendModalityPrompt(tags=("DEPTH WRIST LEFT", "DEPTH WRIST RIGHT"))(
+        {"prompt": "pick banana"}
+    )
+    assert tagged["prompt"] == "pick banana DEPTH WRIST LEFT DEPTH WRIST RIGHT"
+    skipped = aloha_policy.AppendModalityPrompt(tags=())({"prompt": "pick banana"})
+    assert skipped["prompt"] == "pick banana"
+
+    import pathlib
+    import yaml
+
+    yaml_dir = pathlib.Path(__file__).resolve().parent.parent / "configs"
+    yaml_expected = {
+        "train_pi05_rgb.yaml": (False, []),
+        "train_pi05_rgb_depth_head.yaml": (True, ["DEPTH HEAD"]),
+        "train_pi05_rgb_depth_wrist.yaml": (True, ["DEPTH WRIST LEFT", "DEPTH WRIST RIGHT"]),
+        "train_pi05_rgb_ft.yaml": (True, ["FT LEFT", "FT RIGHT"]),
+        "train_pi05_rgb_depth_head_ft.yaml": (True, ["DEPTH HEAD", "FT LEFT", "FT RIGHT"]),
+        "train_pi05_rgb_depth_wrist_ft.yaml": (
+            True,
+            ["DEPTH WRIST LEFT", "DEPTH WRIST RIGHT", "FT LEFT", "FT RIGHT"],
+        ),
+    }
+    for fname, (flag, tags) in yaml_expected.items():
+        raw = yaml.safe_load((yaml_dir / fname).read_text(encoding="utf-8"))
+        data = raw["data"]
+        assert data["append_modality_prompt"] is flag, fname
+        assert list(data.get("modality_prompt_tags") or []) == tags, fname
+        print(f"ok  yaml {fname}")
+
     print("all 6 modality presets ok")
 
 

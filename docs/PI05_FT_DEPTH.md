@@ -32,6 +32,22 @@ DEPTH 档会挂 `LoadSidecarDepthPNGs(depth_keys=...)`，只读选中的相机 P
 
 动作维是 TongBot 16D：`delta_action_dims: [7, 7, -1, -1]`（左7 | 右7 | 左爪 abs | 右爪 abs）。
 
+## 语言 token（DEPTH / FT 标签）
+
+YAML `data.append_modality_prompt` 控制要不要把额外模态写进 Paligemma prompt。开了以后任务文本变成：
+
+```text
+Task: pick banana DEPTH WRIST LEFT DEPTH WRIST RIGHT, State: ...; Action:
+```
+
+| DEPTH / FT | 默认 `modality_prompt_tags` |
+|---|---|
+| HEAD | `DEPTH HEAD` |
+| WRIST | `DEPTH WRIST LEFT` `DEPTH WRIST RIGHT` |
+| FT | `FT LEFT` `FT RIGHT` |
+
+DEPTH/FT 档 YAML 默认 `true`；只训 RGB 为 `false`（没有可拼的标签）。关掉则只加图 / Force6DEncoder，不加这些语言 token。文案可在 YAML 里改 `modality_prompt_tags`。tokenizer 会把 `_` 换成空格，标签请用空格。
+
 ## 开训
 
 1. 填对应 YAML 的 `data.repo_id` / `data.assets.assets_dir` / `default_prompt` / `exp_name`。
