@@ -1,10 +1,6 @@
-# π0.5 多模态（RGB + depth PNG + 末端 6D 力/力矩）
-#
-# 不是在 pi05_aloha 上改两个 boolean。旧预设的 Repack 只有 RGB/state/action，
-# AlohaInputs 也不会转发 depths/force6d；depth 还是 LeRobot 读不到的旁路 PNG。
-#
-# 本 YAML 必须配 config_name: pi05_aloha_ft_depth（见 src/openpi/training/config.py）。
-# 分支: train/pi05-ft-depth（从 tongbot 拉出，不改正在跑的 RGB-only 训练）。
+# 旧档：RGB + 三路 DEPTH + FT（pi05_aloha_ft_depth）。
+# 新实验请改用 configs/train_pi05_rgb*.yaml 矩阵（HEAD/WRIST 分开，FT 可关）。
+# 见 docs/PI05_FT_DEPTH.md。
 #
 # 用法:
 #   uv run scripts/compute_norm_stats.py --config-name pi05_aloha_ft_depth \

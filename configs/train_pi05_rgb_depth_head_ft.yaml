@@ -1,0 +1,59 @@
+# 本机 π0.5 消融：RGB + DEPTH(HEAD=cam_mid) + FT
+#
+# 矩阵见 configs/train_pi05_rgb.yaml 文件头。
+# Depth 走 SigLIP；FT 走 Force6DEncoder。不要改 use_depth_encoder: true。
+#
+# 用法:
+#   python scripts/train_from_yaml.py --config configs/train_pi05_rgb_depth_head_ft.yaml --dry-run
+#   uv run scripts/compute_norm_stats.py --config-name pi05_aloha_rgb_depth_head_ft --dataset-dir /path/to/lerobot
+
+config_name: pi05_aloha_rgb_depth_head_ft
+framework: jax
+
+exp_name: REPLACE_ME_rgb_depth_head_ft
+project_name: openpi
+checkpoint_base_dir: ./checkpoints
+assets_base_dir: ./assets
+
+batch_size: 32
+num_epochs: 100
+seed: 42
+num_workers: 6
+log_interval: 100
+save_every_epochs: 10
+save_full_every_epochs: 20
+keep_period: 5000
+overwrite: false
+resume: false
+wandb_enabled: false
+fsdp_devices: 1
+ema_decay: 0.99
+
+pytorch_training_precision: bfloat16
+pytorch_weight_path:
+
+model:
+  action_horizon: 50
+
+lr_schedule:
+  warmup_steps: 1000
+  peak_lr: 2.5e-5
+  decay_lr: 2.5e-6
+
+optimizer:
+  b1: 0.9
+  b2: 0.95
+  eps: 1.0e-8
+  weight_decay: 1.0e-10
+  clip_gradient_norm: 1.0
+
+data:
+  repo_id: /REPLACE/ME/lerobot_ft_depth
+  assets:
+    assets_dir: /REPLACE/ME/lerobot_ft_depth
+    asset_id: "."
+  default_prompt: "REPLACE_ME"
+  prompt_from_task: true
+  prompt_from_subtask: false
+  adapt_to_pi: false
+  delta_action_dims: [7, 7, -1, -1]

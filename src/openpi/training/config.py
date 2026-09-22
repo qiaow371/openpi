@@ -745,6 +745,92 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+# cigai20-ft-depth / TongBot：三路 RGB 永远进网；DEPTH 选 HEAD 或 WRIST；FT 独立开关。
+# 不改 pi05_aloha（front/left/right 旧数据集）。HEAD = cam_mid，WRIST = cam_left+cam_right。
+_TONGBOT_FT_DEPTH_PLACEHOLDER = "/home/agilex/dataset-pika_aloha-joint"
+_TONGBOT_RGB_CAMS = {
+    "base_0_rgb": "observation.images.cam_mid",
+    "left_wrist_0_rgb": "observation.images.cam_left",
+    "right_wrist_0_rgb": "observation.images.cam_right",
+}
+_TONGBOT_DEPTH_BY_CAM: dict[str, dict[str, str]] = {
+    "head": {"cam_mid": "observation.depths.cam_mid"},
+    "wrist": {
+        "cam_left": "observation.depths.cam_left",
+        "cam_right": "observation.depths.cam_right",
+    },
+    "all": {
+        "cam_left": "observation.depths.cam_left",
+        "cam_mid": "observation.depths.cam_mid",
+        "cam_right": "observation.depths.cam_right",
+    },
+}
+_TONGBOT_FORCE6D = {
+    "left": "observation.force6d.left",
+    "right": "observation.force6d.right",
+}
+
+
+def _tongbot_modality_repack(
+    *,
+    depth: Literal["none", "head", "wrist", "all"],
+    use_ft: bool,
+    dataset_root: str = _TONGBOT_FT_DEPTH_PLACEHOLDER,
+) -> _transforms.Group:
+    """Build Repack (+ optional sidecar PNG loader) for one modality combo."""
+    structure: dict[str, Any] = {
+        "images": dict(_TONGBOT_RGB_CAMS),
+        "state": "observation.state",
+        "actions": "action",
+    }
+    inputs: list[Any] = []
+    if depth != "none":
+        depth_map = dict(_TONGBOT_DEPTH_BY_CAM[depth])
+        structure["depths"] = depth_map
+        inputs.append(
+            aloha_policy.LoadSidecarDepthPNGs(
+                dataset_root=dataset_root,
+                depth_keys=tuple(depth_map.values()),
+            )
+        )
+    if use_ft:
+        structure["force6d"] = dict(_TONGBOT_FORCE6D)
+    inputs.append(_transforms.RepackTransform(structure))
+    return _transforms.Group(inputs=inputs)
+
+
+def _tongbot_modality_train_config(
+    *,
+    name: str,
+    depth: Literal["none", "head", "wrist", "all"],
+    use_ft: bool,
+) -> TrainConfig:
+    return TrainConfig(
+        name=name,
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            use_depth_encoder=False,
+            use_force6d_encoder=use_ft,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id=_TONGBOT_FT_DEPTH_PLACEHOLDER,
+            assets=AssetsConfig(
+                assets_dir=_TONGBOT_FT_DEPTH_PLACEHOLDER,
+                asset_id=".",
+            ),
+            default_prompt="null",
+            adapt_to_pi=False,
+            use_delta_joint_actions=True,
+            # TongBot 16D: 左7 | 右7 | 左爪 abs | 右爪 abs
+            delta_action_dims=(7, 7, -1, -1),
+            repack_transforms=_tongbot_modality_repack(depth=depth, use_ft=use_ft),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80000,
+        batch_size=16,
+    )
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -1171,6 +1257,13 @@ _CONFIGS = [
         num_train_steps=80000,
         batch_size=16,
     ),
+    # 本机 cigai20-ft-depth 消融：RGB 三路固定；DEPTH=HEAD|WRIST；FT 开/关。YAML 在 configs/train_pi05_rgb*.yaml。
+    _tongbot_modality_train_config(name="pi05_aloha_rgb", depth="none", use_ft=False),
+    _tongbot_modality_train_config(name="pi05_aloha_rgb_depth_head", depth="head", use_ft=False),
+    _tongbot_modality_train_config(name="pi05_aloha_rgb_depth_wrist", depth="wrist", use_ft=False),
+    _tongbot_modality_train_config(name="pi05_aloha_rgb_ft", depth="none", use_ft=True),
+    _tongbot_modality_train_config(name="pi05_aloha_rgb_depth_head_ft", depth="head", use_ft=True),
+    _tongbot_modality_train_config(name="pi05_aloha_rgb_depth_wrist_ft", depth="wrist", use_ft=True),
     TrainConfig(
         name="pi05_aloha_lora",
         model=pi0_config.Pi0Config(pi05=True),

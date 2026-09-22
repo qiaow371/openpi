@@ -1,0 +1,67 @@
+# 本机 π0.5 消融：只训练 RGB（三路 cam_mid / cam_left / cam_right）
+#
+# 矩阵（各一份 YAML，config_name 必须对上）:
+#   1. RGB                      configs/train_pi05_rgb.yaml
+#   2. RGB + DEPTH HEAD         configs/train_pi05_rgb_depth_head.yaml
+#   3. RGB + DEPTH WRIST        configs/train_pi05_rgb_depth_wrist.yaml
+#   4. RGB + FT                 configs/train_pi05_rgb_ft.yaml
+#   5. RGB + DEPTH HEAD + FT    configs/train_pi05_rgb_depth_head_ft.yaml
+#   6. RGB + DEPTH WRIST + FT   configs/train_pi05_rgb_depth_wrist_ft.yaml
+#
+# HEAD = cam_mid；WRIST = cam_left + cam_right。RGB 三路始终进网。
+# 用法:
+#   python scripts/train_from_yaml.py --config configs/train_pi05_rgb.yaml --dry-run
+#   uv run scripts/compute_norm_stats.py --config-name pi05_aloha_rgb --dataset-dir /path/to/lerobot
+
+config_name: pi05_aloha_rgb
+framework: jax
+
+exp_name: REPLACE_ME_rgb
+project_name: openpi
+checkpoint_base_dir: ./checkpoints
+assets_base_dir: ./assets
+
+batch_size: 32
+num_epochs: 100
+seed: 42
+num_workers: 6
+log_interval: 100
+save_every_epochs: 10
+save_full_every_epochs: 20
+keep_period: 5000
+overwrite: false
+resume: false
+wandb_enabled: false
+fsdp_devices: 1
+ema_decay: 0.99
+
+pytorch_training_precision: bfloat16
+pytorch_weight_path:
+
+model:
+  action_horizon: 50
+
+lr_schedule:
+  warmup_steps: 1000
+  peak_lr: 2.5e-5
+  decay_lr: 2.5e-6
+
+optimizer:
+  b1: 0.9
+  b2: 0.95
+  eps: 1.0e-8
+  weight_decay: 1.0e-10
+  clip_gradient_norm: 1.0
+
+# cigai20-ft-depth LeRobot 根目录。本档不读 depth PNG、不走 Force6DEncoder。
+data:
+  repo_id: /REPLACE/ME/lerobot_ft_depth
+  assets:
+    assets_dir: /REPLACE/ME/lerobot_ft_depth
+    asset_id: "."
+  default_prompt: "REPLACE_ME"
+  prompt_from_task: true
+  prompt_from_subtask: false
+  adapt_to_pi: false
+  # TongBot 16D: 左7 | 右7 | 左爪 abs | 右爪 abs
+  delta_action_dims: [7, 7, -1, -1]
