@@ -97,36 +97,6 @@ class DepthsAsSiglipImages(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
-class AppendModalityPrompt(transforms.DataTransformFn):
-    """把额外模态标签拼进 language prompt，再交给 Paligemma tokenize。
-
-    例：``pick banana`` + tags ``("DEPTH WRIST LEFT", "DEPTH WRIST RIGHT")``
-    → ``pick banana DEPTH WRIST LEFT DEPTH WRIST RIGHT``
-    π0.5 最终是 ``Task: {prompt} ..., State: ...; Action: ``。
-    tokenizer 会把 ``_`` 换成空格，标签请用空格（不要 ``DEPTH_WRIST_LEFT``）。
-    必须插在 ``TokenizePrompt`` 之前；``tags`` 为空则是 no-op。
-    """
-
-    tags: tuple[str, ...] = ()
-
-    def __call__(self, data: dict) -> dict:
-        if not self.tags:
-            return data
-        prompt = data.get("prompt")
-        if prompt is None:
-            return data
-        if not isinstance(prompt, str):
-            prompt = prompt.item() if hasattr(prompt, "item") else str(prompt)
-        suffix = " ".join(str(t).strip() for t in self.tags if str(t).strip())
-        if not suffix:
-            return data
-        if suffix not in prompt:
-            prompt = f"{prompt.rstrip()} {suffix}"
-        data["prompt"] = prompt
-        return data
-
-
-@dataclasses.dataclass(frozen=True)
 class ProcessTactile(transforms.DataTransformFn):
     """通用触觉数据处理（独立组件）
     

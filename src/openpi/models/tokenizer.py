@@ -47,6 +47,13 @@ class PaligemmaTokenizer:
 
         return np.asarray(tokens), np.asarray(mask)
 
+    def encode_fragment(self, text: str) -> np.ndarray:
+        """Encode a mid-sequence label (e.g. ``DEPTH WRIST LEFT``) without BOS or Task wrapper."""
+        cleaned = text.strip().replace("_", " ").replace("\n", " ")
+        if not cleaned:
+            return np.asarray([], dtype=np.int32)
+        return np.asarray(self._tokenizer.encode(cleaned, add_bos=False), dtype=np.int32)
+
 
 class FASTTokenizer:
     def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):

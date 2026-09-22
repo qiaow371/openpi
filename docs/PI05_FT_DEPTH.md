@@ -34,19 +34,27 @@ DEPTH 档会挂 `LoadSidecarDepthPNGs(depth_keys=...)`，只读选中的相机 P
 
 ## 语言 token（DEPTH / FT 标签）
 
-YAML `data.append_modality_prompt` 控制要不要把额外模态写进 Paligemma prompt。开了以后任务文本变成：
+YAML `data.append_modality_prompt` 控制要不要在 **每个额外模态前面** 插 Paligemma 语言 token。**不是**拼进 Task 文本。
+
+开了以后 prefix 类似：
 
 ```text
-Task: pick banana DEPTH WRIST LEFT DEPTH WRIST RIGHT, State: ...; Action:
+[RGB head][RGB left][RGB right]
+[DEPTH WRIST LEFT][left depth SigLIP tokens]
+[DEPTH WRIST RIGHT][right depth SigLIP tokens]
+[FT LEFT][force6d left][FT RIGHT][force6d right]
+[Task: pick banana, State: ...; Action:]
 ```
 
-| DEPTH / FT | 默认 `modality_prompt_tags` |
+| 模态 key | 默认 token |
 |---|---|
-| HEAD | `DEPTH HEAD` |
-| WRIST | `DEPTH WRIST LEFT` `DEPTH WRIST RIGHT` |
-| FT | `FT LEFT` `FT RIGHT` |
+| `cam_mid_depth` | `DEPTH HEAD` |
+| `cam_left_depth` | `DEPTH WRIST LEFT` |
+| `cam_right_depth` | `DEPTH WRIST RIGHT` |
+| `force6d.left` | `FT LEFT` |
+| `force6d.right` | `FT RIGHT` |
 
-DEPTH/FT 档 YAML 默认 `true`；只训 RGB 为 `false`（没有可拼的标签）。关掉则只加图 / Force6DEncoder，不加这些语言 token。文案可在 YAML 里改 `modality_prompt_tags`。tokenizer 会把 `_` 换成空格，标签请用空格。
+DEPTH/FT 档 YAML 默认 `true`；只训 RGB 为 `false`。关掉则只加图 / Force6DEncoder。文案改 `data.modality_prompt_tags` 的 dict。tokenizer 会把 `_` 换成空格，标签请用空格。
 
 ## 开训
 

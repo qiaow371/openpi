@@ -100,6 +100,13 @@ def main() -> None:
         raise SystemExit(f"错误: 配置文件不存在: {yaml_path}")
 
     cfg, framework = load_train_config(yaml_path)
+    data_cfg = cfg.data
+    if bool(getattr(data_cfg, "append_modality_prompt", False)):
+        tags = getattr(data_cfg, "modality_prompt_tags", None) or {}
+        model_kwargs: dict[str, Any] = {"use_modality_prompt_tokens": True}
+        if tags:
+            model_kwargs["modality_prompt_tags"] = dict(tags)
+        cfg = dataclasses.replace(cfg, model=dataclasses.replace(cfg.model, **model_kwargs))
     if args.resume:
         cfg = dataclasses.replace(cfg, resume=True, overwrite=False)
     if args.overwrite:
@@ -134,6 +141,7 @@ def main() -> None:
     print(f"repo_id:     {repo_id}")
     print(f"prompt_from_task:    {prompt_task}")
     print(f"prompt_from_subtask: {prompt_sub}")
+    print(f"modality_prompt:     {bool(getattr(cfg.model, 'use_modality_prompt_tokens', False))} {dict(getattr(cfg.model, 'modality_prompt_tags', {}) or {})}")
     print(f"trainable_modules:   {getattr(cfg, 'trainable_modules', 'all')}")
     stage2 = getattr(cfg, "stage2_trainable_modules", None)
     if stage2:

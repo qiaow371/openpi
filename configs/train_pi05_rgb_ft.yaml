@@ -54,8 +54,10 @@ data:
   default_prompt: "REPLACE_ME"
   prompt_from_task: true
   prompt_from_subtask: false
-  # true：任务文本后拼 FT 标签再 tokenize。关掉则只走 Force6DEncoder、不加语言 token。
+  # true：在左右 FT token 前分别插入 "FT LEFT" / "FT RIGHT"（不写进 Task）
   append_modality_prompt: true
-  modality_prompt_tags: ["FT LEFT", "FT RIGHT"]
+  modality_prompt_tags:
+    force6d.left: "FT LEFT"
+    force6d.right: "FT RIGHT"
   adapt_to_pi: false
   delta_action_dims: [7, 7, -1, -1]

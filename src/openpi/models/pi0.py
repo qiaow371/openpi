@@ -235,8 +235,37 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+        self._modality_prompt_ids: dict[str, tuple[int, ...]] = {}
+        if getattr(config, "use_modality_prompt_tokens", False):
+            tags = getattr(config, "modality_prompt_tags", None) or {}
+            if tags:
+                from openpi.models.tokenizer import PaligemmaTokenizer
+
+                tok = PaligemmaTokenizer(max_len=32)
+                for key, text in tags.items():
+                    ids = tok.encode_fragment(str(text))
+                    if ids.size:
+                        self._modality_prompt_ids[str(key)] = tuple(int(x) for x in ids.tolist())
+
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
+
+    def _append_modality_prompt(
+        self,
+        name: str,
+        batch_size: int,
+        tokens: list,
+        input_mask: list,
+        ar_mask: list,
+    ) -> None:
+        ids_t = self._modality_prompt_ids.get(name)
+        if not ids_t:
+            return
+        ids = jnp.broadcast_to(jnp.asarray(ids_t, dtype=jnp.int32)[None, :], (batch_size, len(ids_t)))
+        emb = self.PaliGemma.llm(ids, method="embed")
+        tokens.append(emb)
+        input_mask.append(jnp.ones((batch_size, len(ids_t)), dtype=jnp.bool_))
+        ar_mask += [False] * len(ids_t)
 
     @at.typecheck
     def embed_prefix(
@@ -246,8 +275,9 @@ class Pi0(_model.BaseModel):
         ar_mask = []
         tokens = []
 
-        # 1) embed RGB images (only from obs.images)
+        # 1) embed RGB / extra SigLIP images. Optional language tag immediately before each extra modality.
         for name, img in obs.images.items():
+            self._append_modality_prompt(name, img.shape[0], tokens, input_mask, ar_mask)
             image_tokens, _ = self.PaliGemma.img(img, train=False)
 
             tokens.append(image_tokens)
@@ -273,6 +303,7 @@ class Pi0(_model.BaseModel):
                     # 只使用指定的深度图（如果 depth_image_keys 为空则使用全部）
                     if name not in depth_keys:
                         continue
+                    self._append_modality_prompt(name, depth_img.shape[0], tokens, input_mask, ar_mask)
                     depth_tokens, _ = self.depth_encoder(depth_img, train=False)
                     tokens.append(depth_tokens)
                     depth_mask = obs.depths_masks.get(name, jnp.ones((depth_tokens.shape[0],), dtype=jnp.bool_))
@@ -315,6 +346,9 @@ class Pi0(_model.BaseModel):
             for force6d_key, force6d_vec in obs.force6d.items():
                 # force6d_vec shape: [B, 6]
                 # Encode to [B, emb_dim], then add token dimension: [B, 1, emb_dim]
+                self._append_modality_prompt(
+                    f"force6d.{force6d_key}", force6d_vec.shape[0], tokens, input_mask, ar_mask
+                )
                 encoded_force6d = self.force6d_encoder(force6d_vec, train=False)  # [B, emb_dim]
                 force6d_tokens = encoded_force6d[:, None, :]  # [B, 1, emb_dim]
                 

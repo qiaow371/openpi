@@ -54,6 +54,11 @@ class Pi0Config(_model.BaseModelConfig):
     force6d_hidden_dim: int = 32  # Hidden dimension in Force6DEncoder MLP
     force6d_num_layers: int = 2  # Number of MLP layers in Force6DEncoder
 
+    # Insert Paligemma language tokens immediately before each extra modality in prefix
+    # (not appended onto the Task string). Keys: cam_*_depth or force6d.left / force6d.right.
+    use_modality_prompt_tokens: bool = False
+    modality_prompt_tags: dict[str, str] = dataclasses.field(default_factory=dict)
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)

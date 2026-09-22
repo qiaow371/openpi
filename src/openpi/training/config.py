@@ -260,10 +260,10 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     # YAML: data.prompt_from_subtask: true  （需要 meta/episodes_detailed_task.jsonl）
     prompt_from_subtask: bool = False
     # YAML: data.append_modality_prompt: true
-    # 把 DEPTH/FT 标签拼进任务文本再 tokenize，例如 "DEPTH WRIST LEFT"。
+    # 在 prefix 里、每个 DEPTH/FT 模态的 token 前面插入对应语言 token（不是拼进 Task）。
     append_modality_prompt: bool = False
-    # YAML: data.modality_prompt_tags: ["DEPTH HEAD"]  省略则用工厂按 DEPTH/FT 填的默认。
-    modality_prompt_tags: Sequence[str] = ()
+    # YAML: data.modality_prompt_tags: {cam_left_depth: "DEPTH WRIST LEFT"}
+    modality_prompt_tags: dict[str, str] = dataclasses.field(default_factory=dict)
     # If true, this will convert the joint and gripper values from the standard Aloha space to
     # the space used by the pi internal runtime which was used to train the base model. People who
     # use standard Aloha data should set this to true.
@@ -317,18 +317,6 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             )
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
-        tags = tuple(str(t) for t in self.modality_prompt_tags if str(t).strip())
-        if self.append_modality_prompt and tags:
-            inputs = list(model_transforms.inputs)
-            inserted = False
-            for i, t in enumerate(inputs):
-                if isinstance(t, (_transforms.TokenizePrompt, _transforms.TokenizeFASTInputs)):
-                    inputs.insert(i, aloha_policy.AppendModalityPrompt(tags=tags))
-                    inserted = True
-                    break
-            if not inserted:
-                inputs.append(aloha_policy.AppendModalityPrompt(tags=tags))
-            model_transforms = dataclasses.replace(model_transforms, inputs=tuple(inputs))
 
         repack_transforms = self.repack_transforms
         if self.repo_id is not tyro.MISSING and self.repo_id:
@@ -786,24 +774,34 @@ _TONGBOT_FORCE6D = {
     "left": "observation.force6d.left",
     "right": "observation.force6d.right",
 }
-_TONGBOT_PROMPT_TAGS_BY_DEPTH: dict[str, tuple[str, ...]] = {
-    "none": (),
-    "head": ("DEPTH HEAD",),
-    "wrist": ("DEPTH WRIST LEFT", "DEPTH WRIST RIGHT"),
-    "all": ("DEPTH HEAD", "DEPTH WRIST LEFT", "DEPTH WRIST RIGHT"),
+_TONGBOT_PROMPT_TAGS_BY_DEPTH: dict[str, dict[str, str]] = {
+    "none": {},
+    "head": {"cam_mid_depth": "DEPTH HEAD"},
+    "wrist": {
+        "cam_left_depth": "DEPTH WRIST LEFT",
+        "cam_right_depth": "DEPTH WRIST RIGHT",
+    },
+    "all": {
+        "cam_mid_depth": "DEPTH HEAD",
+        "cam_left_depth": "DEPTH WRIST LEFT",
+        "cam_right_depth": "DEPTH WRIST RIGHT",
+    },
 }
-_TONGBOT_PROMPT_TAGS_FT: tuple[str, ...] = ("FT LEFT", "FT RIGHT")
+_TONGBOT_PROMPT_TAGS_FT: dict[str, str] = {
+    "force6d.left": "FT LEFT",
+    "force6d.right": "FT RIGHT",
+}
 
 
 def _tongbot_modality_prompt_tags(
     depth: Literal["none", "head", "wrist", "all"],
     use_ft: bool,
-) -> tuple[str, ...]:
-    """Language tokens naming extra views, e.g. ``DEPTH WRIST LEFT``."""
-    tags = list(_TONGBOT_PROMPT_TAGS_BY_DEPTH[depth])
+) -> dict[str, str]:
+    """Prefix labels inserted immediately before each extra modality, not onto Task."""
+    tags = dict(_TONGBOT_PROMPT_TAGS_BY_DEPTH[depth])
     if use_ft:
-        tags.extend(_TONGBOT_PROMPT_TAGS_FT)
-    return tuple(tags)
+        tags.update(_TONGBOT_PROMPT_TAGS_FT)
+    return tags
 
 
 def _tongbot_modality_repack(
@@ -840,12 +838,15 @@ def _tongbot_modality_train_config(
     depth: Literal["none", "head", "wrist", "all"],
     use_ft: bool,
 ) -> TrainConfig:
+    tag_map = _tongbot_modality_prompt_tags(depth, use_ft)
     return TrainConfig(
         name=name,
         model=pi0_config.Pi0Config(
             pi05=True,
             use_depth_encoder=False,
             use_force6d_encoder=use_ft,
+            use_modality_prompt_tokens=False,
+            modality_prompt_tags=tag_map,
         ),
         data=LeRobotAlohaDataConfig(
             repo_id=_TONGBOT_FT_DEPTH_PLACEHOLDER,
@@ -858,9 +859,9 @@ def _tongbot_modality_train_config(
             use_delta_joint_actions=True,
             # TongBot 16D: 左7 | 右7 | 左爪 abs | 右爪 abs
             delta_action_dims=(7, 7, -1, -1),
-            # YAML data.append_modality_prompt: true 才会把这些标签拼进 prompt。
+            # YAML data.append_modality_prompt: true 才在每个模态前插入语言 token。
             append_modality_prompt=False,
-            modality_prompt_tags=_tongbot_modality_prompt_tags(depth, use_ft),
+            modality_prompt_tags=tag_map,
             repack_transforms=_tongbot_modality_repack(depth=depth, use_ft=use_ft),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
