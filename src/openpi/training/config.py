@@ -750,8 +750,8 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
-# cigai20-ft-depth / TongBot：三路 RGB 永远进网；DEPTH 选 HEAD 或 WRIST；FT 独立开关。
-# 不改 pi05_aloha（front/left/right 旧数据集）。HEAD = cam_mid，WRIST = cam_left+cam_right。
+# cigai20-ft-depth / TongBot：三路 RGB 永远进网；DEPTH 三选一 HEAD / LEFT WRIST / RIGHT WRIST；FT 独立开关。
+# 不改 pi05_aloha（front/left/right 旧数据集）。HEAD = cam_mid。
 _TONGBOT_FT_DEPTH_PLACEHOLDER = "/home/agilex/dataset-pika_aloha-joint"
 _TONGBOT_RGB_CAMS = {
     "base_0_rgb": "observation.images.cam_mid",
@@ -760,15 +760,8 @@ _TONGBOT_RGB_CAMS = {
 }
 _TONGBOT_DEPTH_BY_CAM: dict[str, dict[str, str]] = {
     "head": {"cam_mid": "observation.depths.cam_mid"},
-    "wrist": {
-        "cam_left": "observation.depths.cam_left",
-        "cam_right": "observation.depths.cam_right",
-    },
-    "all": {
-        "cam_left": "observation.depths.cam_left",
-        "cam_mid": "observation.depths.cam_mid",
-        "cam_right": "observation.depths.cam_right",
-    },
+    "left": {"cam_left": "observation.depths.cam_left"},
+    "right": {"cam_right": "observation.depths.cam_right"},
 }
 _TONGBOT_FORCE6D = {
     "left": "observation.force6d.left",
@@ -777,15 +770,8 @@ _TONGBOT_FORCE6D = {
 _TONGBOT_PROMPT_TAGS_BY_DEPTH: dict[str, dict[str, str]] = {
     "none": {},
     "head": {"cam_mid_depth": "DEPTH HEAD"},
-    "wrist": {
-        "cam_left_depth": "DEPTH WRIST LEFT",
-        "cam_right_depth": "DEPTH WRIST RIGHT",
-    },
-    "all": {
-        "cam_mid_depth": "DEPTH HEAD",
-        "cam_left_depth": "DEPTH WRIST LEFT",
-        "cam_right_depth": "DEPTH WRIST RIGHT",
-    },
+    "left": {"cam_left_depth": "DEPTH WRIST LEFT"},
+    "right": {"cam_right_depth": "DEPTH WRIST RIGHT"},
 }
 _TONGBOT_PROMPT_TAGS_FT: dict[str, str] = {
     "force6d.left": "FT LEFT",
@@ -794,7 +780,7 @@ _TONGBOT_PROMPT_TAGS_FT: dict[str, str] = {
 
 
 def _tongbot_modality_prompt_tags(
-    depth: Literal["none", "head", "wrist", "all"],
+    depth: Literal["none", "head", "left", "right"],
     use_ft: bool,
 ) -> dict[str, str]:
     """Prefix labels inserted immediately before each extra modality, not onto Task."""
@@ -806,7 +792,7 @@ def _tongbot_modality_prompt_tags(
 
 def _tongbot_modality_repack(
     *,
-    depth: Literal["none", "head", "wrist", "all"],
+    depth: Literal["none", "head", "left", "right"],
     use_ft: bool,
     dataset_root: str = _TONGBOT_FT_DEPTH_PLACEHOLDER,
 ) -> _transforms.Group:
@@ -835,7 +821,7 @@ def _tongbot_modality_repack(
 def _tongbot_modality_train_config(
     *,
     name: str,
-    depth: Literal["none", "head", "wrist", "all"],
+    depth: Literal["none", "head", "left", "right"],
     use_ft: bool,
 ) -> TrainConfig:
     tag_map = _tongbot_modality_prompt_tags(depth, use_ft)
@@ -1296,13 +1282,15 @@ _CONFIGS = [
         num_train_steps=80000,
         batch_size=16,
     ),
-    # 本机 cigai20-ft-depth 消融：RGB 三路固定；DEPTH=HEAD|WRIST；FT 开/关。YAML 在 configs/train_pi05_rgb*.yaml。
+    # 本机 cigai20-ft-depth 消融：RGB 三路固定；DEPTH=HEAD|LEFT|RIGHT；FT 开/关。
     _tongbot_modality_train_config(name="pi05_aloha_rgb", depth="none", use_ft=False),
     _tongbot_modality_train_config(name="pi05_aloha_rgb_depth_head", depth="head", use_ft=False),
-    _tongbot_modality_train_config(name="pi05_aloha_rgb_depth_wrist", depth="wrist", use_ft=False),
+    _tongbot_modality_train_config(name="pi05_aloha_rgb_depth_left", depth="left", use_ft=False),
+    _tongbot_modality_train_config(name="pi05_aloha_rgb_depth_right", depth="right", use_ft=False),
     _tongbot_modality_train_config(name="pi05_aloha_rgb_ft", depth="none", use_ft=True),
     _tongbot_modality_train_config(name="pi05_aloha_rgb_depth_head_ft", depth="head", use_ft=True),
-    _tongbot_modality_train_config(name="pi05_aloha_rgb_depth_wrist_ft", depth="wrist", use_ft=True),
+    _tongbot_modality_train_config(name="pi05_aloha_rgb_depth_left_ft", depth="left", use_ft=True),
+    _tongbot_modality_train_config(name="pi05_aloha_rgb_depth_right_ft", depth="right", use_ft=True),
     TrainConfig(
         name="pi05_aloha_lora",
         model=pi0_config.Pi0Config(pi05=True),

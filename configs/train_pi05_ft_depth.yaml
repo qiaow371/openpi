@@ -1,5 +1,5 @@
 # 旧档：RGB + 三路 DEPTH + FT（pi05_aloha_ft_depth）。
-# 新实验请改用 configs/train_pi05_rgb*.yaml 矩阵（HEAD/WRIST 分开，FT 可关）。
+# 新实验请改用 configs/train_pi05_rgb*.yaml 矩阵（HEAD / LEFT WRIST / RIGHT WRIST 分开，FT 可关）。
 # 见 docs/PI05_FT_DEPTH.md。
 #
 # 用法:

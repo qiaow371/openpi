@@ -1,14 +1,16 @@
 # 本机 π0.5 消融：只训练 RGB（三路 cam_mid / cam_left / cam_right）
 #
 # 矩阵（各一份 YAML，config_name 必须对上）:
-#   1. RGB                      configs/train_pi05_rgb.yaml
-#   2. RGB + DEPTH HEAD         configs/train_pi05_rgb_depth_head.yaml
-#   3. RGB + DEPTH WRIST        configs/train_pi05_rgb_depth_wrist.yaml
-#   4. RGB + FT                 configs/train_pi05_rgb_ft.yaml
-#   5. RGB + DEPTH HEAD + FT    configs/train_pi05_rgb_depth_head_ft.yaml
-#   6. RGB + DEPTH WRIST + FT   configs/train_pi05_rgb_depth_wrist_ft.yaml
+#   1. RGB                         configs/train_pi05_rgb.yaml
+#   2a. RGB + DEPTH HEAD           configs/train_pi05_rgb_depth_head.yaml
+#   2b. RGB + DEPTH LEFT WRIST     configs/train_pi05_rgb_depth_left.yaml
+#   2c. RGB + DEPTH RIGHT WRIST    configs/train_pi05_rgb_depth_right.yaml
+#   3. RGB + FT                    configs/train_pi05_rgb_ft.yaml
+#   4a. RGB + DEPTH HEAD + FT      configs/train_pi05_rgb_depth_head_ft.yaml
+#   4b. RGB + DEPTH LEFT + FT      configs/train_pi05_rgb_depth_left_ft.yaml
+#   4c. RGB + DEPTH RIGHT + FT     configs/train_pi05_rgb_depth_right_ft.yaml
 #
-# HEAD = cam_mid；WRIST = cam_left + cam_right。RGB 三路始终进网。
+# HEAD = cam_mid；LEFT = cam_left；RIGHT = cam_right。三路 RGB 始终进网，只换 DEPTH。
 # 用法:
 #   python scripts/train_from_yaml.py --config configs/train_pi05_rgb.yaml --dry-run
 #   uv run scripts/compute_norm_stats.py --config-name pi05_aloha_rgb --dataset-dir /path/to/lerobot

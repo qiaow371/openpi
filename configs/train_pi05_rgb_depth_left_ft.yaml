@@ -1,16 +1,16 @@
-# 本机 π0.5 消融：RGB + DEPTH(WRIST=cam_left+cam_right) + FT
+# 本机 π0.5 消融：RGB + DEPTH(LEFT WRIST=cam_left) + FT
 #
-# 矩阵见 configs/train_pi05_rgb.yaml 文件头。
+# 矩阵见 configs/train_pi05_rgb.yaml 文件头。三路 RGB 不变，只加一路左腕 depth。
 # Depth 走 SigLIP；FT 走 Force6DEncoder。不要改 use_depth_encoder: true。
 #
 # 用法:
-#   python scripts/train_from_yaml.py --config configs/train_pi05_rgb_depth_wrist_ft.yaml --dry-run
-#   uv run scripts/compute_norm_stats.py --config-name pi05_aloha_rgb_depth_wrist_ft --dataset-dir /path/to/lerobot
+#   python scripts/train_from_yaml.py --config configs/train_pi05_rgb_depth_left_ft.yaml --dry-run
+#   uv run scripts/compute_norm_stats.py --config-name pi05_aloha_rgb_depth_left_ft --dataset-dir /path/to/lerobot
 
-config_name: pi05_aloha_rgb_depth_wrist_ft
+config_name: pi05_aloha_rgb_depth_left_ft
 framework: jax
 
-exp_name: REPLACE_ME_rgb_depth_wrist_ft
+exp_name: REPLACE_ME_rgb_depth_left_ft
 project_name: openpi
 checkpoint_base_dir: ./checkpoints
 assets_base_dir: ./assets
@@ -58,7 +58,6 @@ data:
   append_modality_prompt: true
   modality_prompt_tags:
     cam_left_depth: "DEPTH WRIST LEFT"
-    cam_right_depth: "DEPTH WRIST RIGHT"
     force6d.left: "FT LEFT"
     force6d.right: "FT RIGHT"
   adapt_to_pi: false

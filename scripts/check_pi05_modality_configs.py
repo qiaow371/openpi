@@ -15,14 +15,17 @@ EXPECTED = {
         "keys": ("observation.depths.cam_mid",),
         "tags": {"cam_mid_depth": "DEPTH HEAD"},
     },
-    "pi05_aloha_rgb_depth_wrist": {
-        "depth": "wrist",
+    "pi05_aloha_rgb_depth_left": {
+        "depth": "left",
         "ft": False,
-        "keys": ("observation.depths.cam_left", "observation.depths.cam_right"),
-        "tags": {
-            "cam_left_depth": "DEPTH WRIST LEFT",
-            "cam_right_depth": "DEPTH WRIST RIGHT",
-        },
+        "keys": ("observation.depths.cam_left",),
+        "tags": {"cam_left_depth": "DEPTH WRIST LEFT"},
+    },
+    "pi05_aloha_rgb_depth_right": {
+        "depth": "right",
+        "ft": False,
+        "keys": ("observation.depths.cam_right",),
+        "tags": {"cam_right_depth": "DEPTH WRIST RIGHT"},
     },
     "pi05_aloha_rgb_ft": {
         "depth": "none",
@@ -40,12 +43,21 @@ EXPECTED = {
             "force6d.right": "FT RIGHT",
         },
     },
-    "pi05_aloha_rgb_depth_wrist_ft": {
-        "depth": "wrist",
+    "pi05_aloha_rgb_depth_left_ft": {
+        "depth": "left",
         "ft": True,
-        "keys": ("observation.depths.cam_left", "observation.depths.cam_right"),
+        "keys": ("observation.depths.cam_left",),
         "tags": {
             "cam_left_depth": "DEPTH WRIST LEFT",
+            "force6d.left": "FT LEFT",
+            "force6d.right": "FT RIGHT",
+        },
+    },
+    "pi05_aloha_rgb_depth_right_ft": {
+        "depth": "right",
+        "ft": True,
+        "keys": ("observation.depths.cam_right",),
+        "tags": {
             "cam_right_depth": "DEPTH WRIST RIGHT",
             "force6d.left": "FT LEFT",
             "force6d.right": "FT RIGHT",
@@ -109,19 +121,24 @@ def main() -> None:
     yaml_expected = {
         "train_pi05_rgb.yaml": (False, {}),
         "train_pi05_rgb_depth_head.yaml": (True, {"cam_mid_depth": "DEPTH HEAD"}),
-        "train_pi05_rgb_depth_wrist.yaml": (
-            True,
-            {"cam_left_depth": "DEPTH WRIST LEFT", "cam_right_depth": "DEPTH WRIST RIGHT"},
-        ),
+        "train_pi05_rgb_depth_left.yaml": (True, {"cam_left_depth": "DEPTH WRIST LEFT"}),
+        "train_pi05_rgb_depth_right.yaml": (True, {"cam_right_depth": "DEPTH WRIST RIGHT"}),
         "train_pi05_rgb_ft.yaml": (True, {"force6d.left": "FT LEFT", "force6d.right": "FT RIGHT"}),
         "train_pi05_rgb_depth_head_ft.yaml": (
             True,
             {"cam_mid_depth": "DEPTH HEAD", "force6d.left": "FT LEFT", "force6d.right": "FT RIGHT"},
         ),
-        "train_pi05_rgb_depth_wrist_ft.yaml": (
+        "train_pi05_rgb_depth_left_ft.yaml": (
             True,
             {
                 "cam_left_depth": "DEPTH WRIST LEFT",
+                "force6d.left": "FT LEFT",
+                "force6d.right": "FT RIGHT",
+            },
+        ),
+        "train_pi05_rgb_depth_right_ft.yaml": (
+            True,
+            {
                 "cam_right_depth": "DEPTH WRIST RIGHT",
                 "force6d.left": "FT LEFT",
                 "force6d.right": "FT RIGHT",
@@ -135,7 +152,7 @@ def main() -> None:
         assert dict(data.get("modality_prompt_tags") or {}) == tags, fname
         print(f"ok  yaml {fname}")
 
-    print("all 6 modality presets ok")
+    print("all 8 modality presets ok")
 
 
 if __name__ == "__main__":

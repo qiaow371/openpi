@@ -1,16 +1,16 @@
-# 本机 π0.5 消融：RGB + DEPTH(WRIST=cam_left+cam_right)
+# 本机 π0.5 消融：RGB + DEPTH(LEFT WRIST=cam_left)
 #
-# 矩阵见 configs/train_pi05_rgb.yaml 文件头。
+# 矩阵见 configs/train_pi05_rgb.yaml 文件头。三路 RGB 不变，只加一路左腕 depth。
 # Depth 走 SigLIP（3 通道灰度并入 images），不要改 use_depth_encoder: true。
 #
 # 用法:
-#   python scripts/train_from_yaml.py --config configs/train_pi05_rgb_depth_wrist.yaml --dry-run
-#   uv run scripts/compute_norm_stats.py --config-name pi05_aloha_rgb_depth_wrist --dataset-dir /path/to/lerobot
+#   python scripts/train_from_yaml.py --config configs/train_pi05_rgb_depth_left.yaml --dry-run
+#   uv run scripts/compute_norm_stats.py --config-name pi05_aloha_rgb_depth_left --dataset-dir /path/to/lerobot
 
-config_name: pi05_aloha_rgb_depth_wrist
+config_name: pi05_aloha_rgb_depth_left
 framework: jax
 
-exp_name: REPLACE_ME_rgb_depth_wrist
+exp_name: REPLACE_ME_rgb_depth_left
 project_name: openpi
 checkpoint_base_dir: ./checkpoints
 assets_base_dir: ./assets
@@ -55,10 +55,8 @@ data:
   default_prompt: "REPLACE_ME"
   prompt_from_task: true
   prompt_from_subtask: false
-  # true：在左右腕 DEPTH 图 token 前分别插入对应语言 token（不写进 Task）
   append_modality_prompt: true
   modality_prompt_tags:
     cam_left_depth: "DEPTH WRIST LEFT"
-    cam_right_depth: "DEPTH WRIST RIGHT"
   adapt_to_pi: false
   delta_action_dims: [7, 7, -1, -1]

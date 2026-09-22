@@ -4,18 +4,20 @@
 
 ## 选项
 
-三路 RGB 始终进网（`cam_mid` / `cam_left` / `cam_right`）。DEPTH 和 FT 是独立开关；DEPTH 再选 HEAD 或 WRIST。
+三路 RGB 始终进网（`cam_mid` / `cam_left` / `cam_right`）。DEPTH 和 FT 是独立开关；DEPTH 三选一：HEAD / LEFT WRIST / RIGHT WRIST（一次只加一路 depth）。
 
 | 选项 | DEPTH | FT | `config_name` | YAML |
 |---|---|---|---|---|
 | 1. 只训练 RGB | 无 | 关 | `pi05_aloha_rgb` | [`configs/train_pi05_rgb.yaml`](../configs/train_pi05_rgb.yaml) |
 | 2a. RGB + DEPTH HEAD | `cam_mid` | 关 | `pi05_aloha_rgb_depth_head` | [`configs/train_pi05_rgb_depth_head.yaml`](../configs/train_pi05_rgb_depth_head.yaml) |
-| 2b. RGB + DEPTH WRIST | `cam_left` + `cam_right` | 关 | `pi05_aloha_rgb_depth_wrist` | [`configs/train_pi05_rgb_depth_wrist.yaml`](../configs/train_pi05_rgb_depth_wrist.yaml) |
+| 2b. RGB + DEPTH LEFT WRIST | `cam_left` | 关 | `pi05_aloha_rgb_depth_left` | [`configs/train_pi05_rgb_depth_left.yaml`](../configs/train_pi05_rgb_depth_left.yaml) |
+| 2c. RGB + DEPTH RIGHT WRIST | `cam_right` | 关 | `pi05_aloha_rgb_depth_right` | [`configs/train_pi05_rgb_depth_right.yaml`](../configs/train_pi05_rgb_depth_right.yaml) |
 | 3. RGB + FT | 无 | 开 | `pi05_aloha_rgb_ft` | [`configs/train_pi05_rgb_ft.yaml`](../configs/train_pi05_rgb_ft.yaml) |
 | 4a. RGB + DEPTH HEAD + FT | `cam_mid` | 开 | `pi05_aloha_rgb_depth_head_ft` | [`configs/train_pi05_rgb_depth_head_ft.yaml`](../configs/train_pi05_rgb_depth_head_ft.yaml) |
-| 4b. RGB + DEPTH WRIST + FT | `cam_left` + `cam_right` | 开 | `pi05_aloha_rgb_depth_wrist_ft` | [`configs/train_pi05_rgb_depth_wrist_ft.yaml`](../configs/train_pi05_rgb_depth_wrist_ft.yaml) |
+| 4b. RGB + DEPTH LEFT + FT | `cam_left` | 开 | `pi05_aloha_rgb_depth_left_ft` | [`configs/train_pi05_rgb_depth_left_ft.yaml`](../configs/train_pi05_rgb_depth_left_ft.yaml) |
+| 4c. RGB + DEPTH RIGHT + FT | `cam_right` | 开 | `pi05_aloha_rgb_depth_right_ft` | [`configs/train_pi05_rgb_depth_right_ft.yaml`](../configs/train_pi05_rgb_depth_right_ft.yaml) |
 
-HEAD = `cam_mid`（头/胸口）。WRIST = 左右腕。不要混用 `pi05_aloha`（那套是 `front/left/right`）。
+HEAD = `cam_mid`（头/胸口）。LEFT = `cam_left`。RIGHT = `cam_right`。不要混用 `pi05_aloha`（那套是 `front/left/right`）。
 
 旧预设 `pi05_aloha_ft_depth` 仍在：三路 depth 全开 + FT。新实验请用上表，不要再用 [`configs/train_pi05_ft_depth.yaml`](../configs/train_pi05_ft_depth.yaml)。
 
@@ -41,8 +43,7 @@ YAML `data.append_modality_prompt` 控制要不要在 **每个额外模态前面
 ```text
 [RGB head][RGB left][RGB right]
 [Task: pick banana, State: ...; Action:]
-[DEPTH WRIST LEFT][left depth SigLIP tokens]
-[DEPTH WRIST RIGHT][right depth SigLIP tokens]
+[DEPTH WRIST LEFT][left depth SigLIP tokens]   # 仅 left 档；head/right 各只插一路
 [FT LEFT][force6d left][FT RIGHT][force6d right]
 ```
 
