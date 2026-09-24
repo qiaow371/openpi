@@ -28,10 +28,23 @@ Depth **不走** 独立 `DepthEncoder`，也不在采集侧 `cv2.resize`。
 
 SigLIP So400m/14 的输入仍是 **224×224**（`ResizeImages`，`resize_with_pad`）。RGB 本来就是这条；这不是把 320×240 depth 硬拉到 640×480。
 
-FT 仍走 `Force6DEncoder`。RGB-only / RGB+DEPTH 预设把 `use_force6d_encoder=False`，Repack 也不带 `force6d`。
+FT 仍走 `Force6DEncoder`。**JAX 和 PyTorch `embed_prefix` 同一顺序**：RGB 0…767 → Task/State/`Action:` 从 768 → DEPTH/FT 从 `768+n_lang`。PyTorch 在 `PI0Pytorch`（`force6d_encoder.py` 两层 MLP）。江算 PPU 用 `framework: pytorch`。RGB-only / RGB+DEPTH 预设把 `use_force6d_encoder=False`，Repack 也不带 `force6d`。
 
 DEPTH 档会挂 `LoadSidecarDepthPNGs(depth_keys=...)`，只读选中的相机 PNG，不会把三路都扫进来。
-现场盘文件名是 `frame_000000.png`，`meta.json` 模板是 `frame-000000.png`；loader **两种都认**。uint16 毫米按 0–4 m 拉到 8-bit 再进 SigLIP（不要 /65535，否则几乎全黑）。FT 若出现 NaN 会 mask 掉，不让 NaN 进 `Force6DEncoder`。
+现场盘文件名是 `frame_000000.png`，`meta.json` 模板是 `frame-000000.png`；loader **两种都认**。uint16 毫米的 8-bit 拉伸用这盘 `compute_norm_stats` 写出的 `depth_mm/<cam>` q01/q99（有效像素，忽略 0）；YAML `max_depth_mm: 4000` **只在还没有这份 stats 时当后备**，不是训练时的硬裁。然后再和 RGB 同一套 `visual_norm: siglip`。FT 若出现 NaN 会 mask 掉，不让 NaN 进 `Force6DEncoder`。
+
+## 归一化（YAML 两组，不要按相机拆）
+
+RGB 和 DEPTH 必须同一套；state 和 FT 必须同一套。
+
+```yaml
+data:
+  visual_norm: siglip      # RGB + DEPTH。uint8 → [-1, 1]，预训练 Paligemma 合同。目前只有这一个选项。
+  max_depth_mm: 4000.0     # 仅无 depth_mm stats 时的后备。训练用这盘 q01/q99 做 mm→8-bit
+  vector_norm: quantile    # state + action + FT。quantile=π0.5；改 zscore 则三者一起改成 π0 风格。
+```
+
+`compute_norm_stats` 会重算 `state` / `actions` / `force6d.left` / `force6d.right`，以及 DEPTH 档的 `depth_mm/<cam>`（有效毫米的 q01/q99）。图像素不进 `Normalize`。换 `vector_norm` 不必重算 stats（quantile 用 q01/q99，zscore 用 mean/std，同一份文件都有）。换数据集必须重算，DEPTH 工作距离变了也会反映在 `depth_mm`。
 
 动作维是 TongBot 16D：`delta_action_dims: [7, 7, -1, -1]`（左7 | 右7 | 左爪 abs | 右爪 abs）。
 
@@ -55,7 +68,7 @@ Action:
 
 `Task:` / `State:` / `Action:` 都是**同一段字符串里的字段标签**（冒号+空格），不是单独的特殊 token 类型。State 数字在这段里；Action 只有 cue，真动作在 suffix 的 50 个连续 token。
 
-DEPTH / FT **没有**预训练槽。它们插在三路 RGB 和这段语言之间；标签写成同样的 `...: ` 形式，例如 `DEPTH WRIST LEFT: `。
+DEPTH / FT **没有**预训练槽。它们接到 **语言块之后**（prefix 尾），避免把 Task/State 的 1D RoPE 从预训练区间挤走。标签写成同样的 `...: ` 形式，例如 `DEPTH WRIST LEFT: `。
 
 ## 语言 token（DEPTH / FT 标签）
 
@@ -64,11 +77,11 @@ YAML `data.append_modality_prompt` 控制要不要在 **DEPTH / FT 前面** 插 
 开了以后 prefix：
 
 ```text
-[RGB head][RGB left][RGB right]                 # 预训练图槽，无标签
-[DEPTH WRIST LEFT: ][这一路 depth]               # 可选；HEAD/LEFT/RIGHT 三选一
-[FT LEFT: ][左力][FT RIGHT: ][右力]               # 可选
+[RGB head][RGB left][RGB right]                 # 预训练图槽，无标签；RoPE 0…767
 [Task: pick banana, State: ...;
-Action: ]
+Action: ]                                       # 预训练语言槽，从 768 起（pad 不占新下标）
+[DEPTH WRIST LEFT: ][这一路 depth]               # 可选；HEAD/LEFT/RIGHT 三选一；从 768+n_lang 起
+[FORCE TORQUE LEFT: ][左力][FORCE TORQUE RIGHT: ][右力]  # 可选；再往后
 ```
 
 | 模态 key | 默认 token |
@@ -76,10 +89,12 @@ Action: ]
 | `cam_mid_depth` | `DEPTH HEAD: ` |
 | `cam_left_depth` | `DEPTH WRIST LEFT: ` |
 | `cam_right_depth` | `DEPTH WRIST RIGHT: ` |
-| `force6d.left` | `FT LEFT: ` |
-| `force6d.right` | `FT RIGHT: ` |
+| `force6d.left` | `FORCE TORQUE LEFT: ` （盘上暂改；**2026-09-23 已开的 00108 FT 进程仍是 `FT LEFT: `**） |
+| `force6d.right` | `FORCE TORQUE RIGHT: ` （同上，进程内仍是 `FT RIGHT: `） |
 
 DEPTH/FT 档 YAML 默认 `true`；只训 RGB 为 `false`。关掉则只加图 / Force6DEncoder。文案改 `data.modality_prompt_tags` 的 dict。tokenizer 会把 `_` 换成空格，标签请用空格。
+
+**推理对齐这批正在训的 ckpt：用旧文案 `FT LEFT: ` / `FT RIGHT: `，不要跟盘上 FORCE TORQUE。** Python 不热加载，活进程没吃到这次改名。
 
 ## 开训
 

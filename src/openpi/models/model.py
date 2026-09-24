@@ -13,7 +13,6 @@ from flax import traverse_util
 import jax
 import jax.numpy as jnp
 import numpy as np
-import orbax.checkpoint as ocp
 import safetensors
 import torch
 
@@ -22,6 +21,13 @@ from openpi.shared import image_tools
 import openpi.shared.array_typing as at
 
 logger = logging.getLogger("openpi")
+
+
+def _orbax():
+    """Lazy import: Huawei NPU image has orbax that crashes on jax DeviceLocalLayout."""
+    import orbax.checkpoint as ocp
+
+    return ocp
 
 # Type variable for array types (JAX arrays, PyTorch tensors, or numpy arrays)
 ArrayT = TypeVar("ArrayT", bound=jax.Array | torch.Tensor | np.ndarray)
@@ -340,7 +346,7 @@ class BaseModelConfig(abc.ABC):
             return _convert(tree)
 
         if remove_extra_params:
-            params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
+            params = _orbax().transform_utils.intersect_trees(state.to_pure_dict(), params)
         params = _normalize_numeric_block_keys(params)
         at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
         state.replace_by_pure_dict(params)
@@ -416,6 +422,7 @@ def restore_params(
         mesh = jax.sharding.Mesh(jax.devices(), ("x",))
         sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
+    ocp = _orbax()
     with ocp.PyTreeCheckpointer() as ckptr:
         metadata = ckptr.metadata(params_path)
         item = {"params": metadata["params"]}

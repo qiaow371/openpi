@@ -42,7 +42,8 @@ def preprocess_observation_pytorch(
 
         # TODO: This is a hack to handle both [B, C, H, W] and [B, H, W, C] formats
         # Handle both [B, C, H, W] and [B, H, W, C] formats
-        is_channels_first = image.shape[1] == 3  # Check if channels are in dimension 1
+        # CHW: [B, C, H, W] with C in {1, 3}. HWC depth copies are [B, H, W, 3] (H != 3).
+        is_channels_first = image.ndim == 4 and image.shape[1] in (1, 3) and image.shape[-1] not in (1, 3)
 
         if is_channels_first:
             # Convert [B, C, H, W] to [B, H, W, C] for processing
@@ -173,4 +174,6 @@ def preprocess_observation_pytorch(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        force6d=getattr(observation, "force6d", None),
+        force6d_masks=getattr(observation, "force6d_masks", None),
     )

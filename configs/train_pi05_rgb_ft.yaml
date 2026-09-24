@@ -51,7 +51,7 @@ data:
   assets:
     assets_dir: /REPLACE/ME/lerobot_ft_depth
     asset_id: "."
-  default_prompt: "REPLACE_ME"
+  default_prompt: "With both hands, pick up the yellow banana and the yellow lemon and put them into the black box; then take the green vegetables and place them into the blue box."
   prompt_from_task: true
   prompt_from_subtask: false
   # true：在左右 FT token 前分别插入 "FT LEFT: " / "FT RIGHT: "（不写进 Task）

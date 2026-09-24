@@ -85,8 +85,13 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
     Returns:
         A new dictionary with the merged parameters.
     """
-    flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
-    flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+    # Tuple keys (not sep="/"): extra modules such as Force6DEncoder keep integer
+    # layer indices; join() on mixed str/int paths raises TypeError.
+    def _path_str(k: tuple) -> str:
+        return "/".join(str(p) for p in k)
+
+    flat_ref = flax.traverse_util.flatten_dict(params)
+    flat_loaded = flax.traverse_util.flatten_dict(loaded_params)
 
     # First, take all weights that are a subset of the reference weights.
     result = {}
@@ -98,14 +103,14 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
 
     # Then, merge any missing weights as defined by the missing regex.
     pattern = re.compile(missing_regex)
-    for k in {k for k in flat_ref if pattern.fullmatch(k)}:
+    for k in {k for k in flat_ref if pattern.fullmatch(_path_str(k))}:
         if k not in result:
             result[k] = flat_ref[k]
-    
+
     # Finally, add all remaining missing keys from reference to ensure structure matches.
-    # This is important for new modules like depth_encoder that aren't in the checkpoint.
+    # This is important for new modules like force6d_encoder that aren't in the checkpoint.
     for k in flat_ref:
         if k not in result:
             result[k] = flat_ref[k]
 
-    return flax.traverse_util.unflatten_dict(result, sep="/")
+    return flax.traverse_util.unflatten_dict(result)

@@ -1,4 +1,6 @@
 import dataclasses
+import json
+import pathlib
 from typing import ClassVar
 
 import einops
@@ -6,6 +8,9 @@ import numpy as np
 import cv2
 from openpi import transforms
 from openpi.shared import image_tools
+
+# DATA_COLLECT 实际写 frame_000000.png；meta.json / depth_path 模板写 frame-000000.png。
+_SIDECAR_DEPTH_FRAME_NAMES = ("frame_{fr:06d}.png", "frame-{fr:06d}.png")
 
 
 # ============================================================================
@@ -61,6 +66,49 @@ class ProcessDepths(transforms.DataTransformFn):
         return data
 
 
+def depth_array_to_mm(depth_img) -> np.ndarray:
+    """uint16 PNG 是毫米。ProcessDepths 若已 /65535，还原成毫米。"""
+    arr = np.asarray(depth_img)
+    if arr.dtype == np.uint16:
+        return arr.astype(np.float32)
+    arr = arr.astype(np.float32)
+    mx = float(np.nanmax(arr) if arr.size else 0.0)
+    return arr * 65535.0 if mx <= 1.5 else arr
+
+
+def depth_mm_quantiles_from_stats(norm_stats) -> tuple[dict[str, float], dict[str, float]]:
+    """从 ``norm_stats.json`` 读每路相机有效毫米的 q01/q99。
+
+    键是 ``depth_mm/<cam>``（和 ``force6d/<arm>`` 一样的扁平写法）。
+    像素本身不进 ``Normalize``；这份统计只给 ``DepthsAsSiglipImages`` 做 mm→8-bit。
+    """
+    q01: dict[str, float] = {}
+    q99: dict[str, float] = {}
+    if not norm_stats:
+        return q01, q99
+    try:
+        flat = transforms.flatten_dict(norm_stats)
+    except (TypeError, ValueError):
+        flat = dict(norm_stats)
+    for key, stats in flat.items():
+        parts = str(key).split("/")
+        if parts[0] != "depth_mm" or len(parts) < 2:
+            continue
+        lo = getattr(stats, "q01", None)
+        hi = getattr(stats, "q99", None)
+        if lo is None or hi is None:
+            continue
+        cam = parts[1]
+        q01[cam] = float(np.asarray(lo).reshape(-1)[0])
+        q99[cam] = float(np.asarray(hi).reshape(-1)[0])
+    return q01, q99
+
+
+def with_depth_mm_stats(transform: "DepthsAsSiglipImages", norm_stats) -> "DepthsAsSiglipImages":
+    q01, q99 = depth_mm_quantiles_from_stats(norm_stats)
+    return dataclasses.replace(transform, mm_q01=q01, mm_q99=q99)
+
+
 @dataclasses.dataclass(frozen=True)
 class DepthsAsSiglipImages(transforms.DataTransformFn):
     """已对齐的 depth → 3 通道图，并入 images，走 SigLIP→Gemma。
@@ -68,7 +116,31 @@ class DepthsAsSiglipImages(transforms.DataTransformFn):
     采集侧 ``rs.align`` 之后 depth 已与 RGB 同 HxW，这里只做单通道复制。
     送到网络前的 224 pad 与 RGB 共用 ``ResizeImages``，那是 SigLIP So400m/14
     的固定输入尺寸，不是采集时 ``cv2.resize`` 把 320×240 硬拉到 640×480。
+
+    uint16 是毫米。不要再 /65535，否则 1–4m 场景几乎全黑。
+    有 ``compute_norm_stats`` 写出的 ``depth_mm/<cam>`` q01/q99 时，按这盘有效像素
+    的分位映射到 0–255（和 state/FT 同一套找分布的办法）。没有 stats 时才用
+    ``max_depth_mm`` 当后备上限。这不是像素 z-score，也不按帧自适应。
     """
+
+    max_depth_mm: float = 4000.0
+    mm_q01: dict[str, float] = dataclasses.field(default_factory=dict)
+    mm_q99: dict[str, float] = dataclasses.field(default_factory=dict)
+
+    def _range_mm(self, key: str) -> tuple[float, float]:
+        lo = self.mm_q01.get(key)
+        hi = self.mm_q99.get(key)
+        if lo is None or hi is None:
+            fallback = float(self.max_depth_mm) if self.max_depth_mm > 0 else 4000.0
+            return 0.0, fallback
+        lo_f, hi_f = float(lo), float(hi)
+        # 16-bit depth no-return is 65535; q99 sitting there washes out 1–4m.
+        fallback = float(self.max_depth_mm) if self.max_depth_mm > 0 else 4000.0
+        if hi_f >= 60000:
+            return lo_f if 0.0 <= lo_f < fallback else 0.0, fallback
+        if hi_f <= lo_f:
+            hi_f = lo_f + 1.0
+        return lo_f, hi_f
 
     def __call__(self, data: dict) -> dict:
         depths = data.get("depths")
@@ -77,16 +149,15 @@ class DepthsAsSiglipImages(transforms.DataTransformFn):
 
         images = dict(data.get("images") or {})
         for key, depth_img in depths.items():
-            arr = np.asarray(depth_img)
-            if arr.dtype == np.uint16:
-                arr = arr.astype(np.float32) / 65535.0
-            else:
-                arr = arr.astype(np.float32)
-            if arr.ndim == 2:
-                arr = arr[..., None]
-            if arr.shape[-1] != 1:
-                arr = arr[..., 0:1]
-            u8 = np.clip(np.round(arr * 255.0), 0, 255).astype(np.uint8)
+            mm = depth_array_to_mm(depth_img)
+            if mm.ndim == 2:
+                mm = mm[..., None]
+            if mm.shape[-1] != 1:
+                mm = mm[..., 0:1]
+            lo, hi = self._range_mm(key)
+            scaled = np.clip((mm - lo) / (hi - lo), 0.0, 1.0)
+            scaled = np.where(mm <= 0, 0.0, scaled)
+            u8 = np.clip(np.round(scaled * 255.0), 0, 255).astype(np.uint8)
             u8 = np.repeat(u8, 3, axis=-1)
             images[f"{key}_depth"] = u8
 
@@ -225,8 +296,12 @@ class ProcessForce6D(transforms.DataTransformFn):
                         f"Expected {self.data_key} dimension to be {self.expected_dim}, "
                         f"got {force_data.shape[0]}"
                     )
-                
-                output_dict[key] = force_data.astype(np.float32)
+                force_data = force_data.astype(np.float32)
+                if not np.isfinite(force_data).all():
+                    output_dict[key] = np.zeros(self.expected_dim, dtype=np.float32)
+                    mask_dict[key] = np.False_
+                    continue
+                output_dict[key] = force_data
                 mask_dict[key] = np.True_
         
         data[self.data_key] = output_dict
@@ -235,6 +310,46 @@ class ProcessForce6D(transforms.DataTransformFn):
 
 
 _SIDECAR_DEPTH_KEY_CACHE: dict[str, tuple[str, ...]] = {}
+_SIDECAR_CHUNK_CACHE: dict[str, int] = {}
+
+
+def sidecar_depth_png_candidates(
+    root: str | pathlib.Path,
+    key: str,
+    episode_index: int,
+    frame_index: int,
+    *,
+    chunks_size: int = 1000,
+) -> list[pathlib.Path]:
+    """DATA_COLLECT 写 ``frame_``；info.json 模板写 ``frame-``。两种都认。"""
+    chunk = int(episode_index) // max(1, int(chunks_size))
+    ep_dir = (
+        pathlib.Path(root)
+        / "depth"
+        / key
+        / f"chunk-{chunk:03d}"
+        / f"episode-{int(episode_index):06d}"
+    )
+    fr = int(frame_index)
+    return [ep_dir / name.format(fr=fr) for name in _SIDECAR_DEPTH_FRAME_NAMES]
+
+
+def resolve_sidecar_depth_png(
+    root: str | pathlib.Path,
+    key: str,
+    episode_index: int,
+    frame_index: int,
+    *,
+    chunks_size: int = 1000,
+) -> pathlib.Path:
+    candidates = sidecar_depth_png_candidates(
+        root, key, episode_index, frame_index, chunks_size=chunks_size
+    )
+    for path in candidates:
+        if path.is_file():
+            return path
+    tried = " | ".join(str(p) for p in candidates)
+    raise FileNotFoundError(f"depth PNG missing (tried {tried})")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -244,6 +359,7 @@ class LoadSidecarDepthPNGs(transforms.DataTransformFn):
     标准 LeRobotDataset 不读 info.json 里 dtype=depth 的旁路文件。
     必须在 RepackTransform 之前跑：写出 observation.depths.* 后才能被 Repack 映射。
     LeRobotAlohaDataConfig.create() 会用 data.repo_id 覆盖 dataset_root。
+    文件名同时认 ``frame_000000.png``（现场）和 ``frame-000000.png``（模板）。
     """
 
     dataset_root: str
@@ -251,11 +367,23 @@ class LoadSidecarDepthPNGs(transforms.DataTransformFn):
     chunks_size: int = 1000
     depth_keys: tuple[str, ...] = ()
 
-    def __call__(self, data: dict) -> dict:
-        import json
-        from pathlib import Path
+    def _chunks_size(self, root: pathlib.Path) -> int:
+        cache_key = str(root)
+        cached = _SIDECAR_CHUNK_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        info_path = root / "meta" / "info.json"
+        size = int(self.chunks_size)
+        if info_path.is_file():
+            try:
+                size = int(json.loads(info_path.read_text(encoding="utf-8")).get("chunks_size") or size)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+        _SIDECAR_CHUNK_CACHE[cache_key] = max(1, size)
+        return _SIDECAR_CHUNK_CACHE[cache_key]
 
-        root = Path(self.dataset_root)
+    def __call__(self, data: dict) -> dict:
+        root = pathlib.Path(self.dataset_root)
         keys = self.depth_keys
         if not keys:
             cache_key = f"{root}:{self.prefix}"
@@ -267,21 +395,14 @@ class LoadSidecarDepthPNGs(transforms.DataTransformFn):
                 _SIDECAR_DEPTH_KEY_CACHE[cache_key] = keys
         ep = int(np.asarray(data["episode_index"]).reshape(-1)[0])
         fr = int(np.asarray(data["frame_index"]).reshape(-1)[0])
-        chunk = ep // int(self.chunks_size)
+        chunk_size = self._chunks_size(root)
         for key in keys:
             if data.get(key) is not None:
                 continue
-            path = (
-                root
-                / "depth"
-                / key
-                / f"chunk-{chunk:03d}"
-                / f"episode-{ep:06d}"
-                / f"frame-{fr:06d}.png"
-            )
+            path = resolve_sidecar_depth_png(root, key, ep, fr, chunks_size=chunk_size)
             img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
             if img is None:
-                raise FileNotFoundError(f"depth PNG missing: {path}")
+                raise FileNotFoundError(f"depth PNG unreadable: {path}")
             data[key] = img
         return data
 
@@ -539,8 +660,14 @@ def _decode_aloha(data: dict, *, adapt_to_pi: bool = False) -> dict:
             # Convert to uint8 if using float images.
             if np.issubdtype(img.dtype, np.floating):
                 img = (255 * img).astype(np.uint8)
-            # Convert from [channel, height, width] to [height, width, channel].
-            return einops.rearrange(img, "c h w -> h w c")
+            # LeRobot RGB is CHW; DepthsAsSiglipImages already wrote HWC uint8.
+            # Rearranging HWC as CHW turns (H, W, 3) into (W, 3, H) and PIL dies
+            # with typekey ((1, 1, H), '|u1').
+            if img.ndim == 2:
+                return img[..., None]
+            if img.ndim == 3 and img.shape[0] in (1, 3) and img.shape[-1] not in (1, 3):
+                return einops.rearrange(img, "c h w -> h w c")
+            return img
 
         images = data["images"]
         images_dict = {name: convert_image(img) for name, img in images.items()}

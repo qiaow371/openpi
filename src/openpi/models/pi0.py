@@ -208,10 +208,10 @@ class Pi0(_model.BaseModel):
         # Initialize force6d encoder if enabled
         if config.use_force6d_encoder:
             from openpi.models import force6d_encoder
-            # Force6DEncoder output_dim should match action_expert_config.width (same as state_proj output)
-            # so that encoded force6d features can be concatenated to state embedding
+            # π0.5: FT tokens sit in prefix next to SigLIP/language (PaliGemma width).
+            # π0: FT is concatenated onto the action-expert state token.
             self.force6d_encoder = force6d_encoder.Force6DEncoder(
-                output_dim=action_expert_config.width,
+                output_dim=paligemma_config.width if config.pi05 else action_expert_config.width,
                 hidden_dim=config.force6d_hidden_dim,
                 num_layers=config.force6d_num_layers,
                 dtype=config.dtype,
@@ -302,7 +302,17 @@ class Pi0(_model.BaseModel):
                 continue
             self._embed_image(name, obs.images[name], tokens, input_mask, ar_mask, obs.image_masks)
 
-        # Extra DEPTH (SigLIP copies as *_depth). Optional tag immediately before each extra view.
+        # Task + discretized State + "Action:" cue immediately after RGB.
+        # RoPE: RGB 0…767, this block from 768. Pad tokens have mask=False and do not
+        # advance positions. Real actions stay in suffix; only the "Action:" cue is here.
+        if obs.tokenized_prompt is not None:
+            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+            tokens.append(tokenized_inputs)
+            input_mask.append(obs.tokenized_prompt_mask)
+            ar_mask += [False] * tokenized_inputs.shape[1]
+
+        # Extra DEPTH/FT (+ optional tags) after the language block: new RoPE tail
+        # starting at 768 + n_lang (not 768). Prefix is bidirectional.
         for name, img in obs.images.items():
             if name in pretrained_rgb:
                 continue
@@ -350,7 +360,6 @@ class Pi0(_model.BaseModel):
                 )
                 ar_mask += [False] * tactile_tokens.shape[1]
 
-        # π0.5: force6d after RGB (+ optional DEPTH), still before Task language.
         if self.force6d_encoder is not None and obs.force6d is not None:
             for force6d_key, force6d_vec in obs.force6d.items():
                 self._append_modality_prompt(
@@ -372,13 +381,6 @@ class Pi0(_model.BaseModel):
                     )
                 )
                 ar_mask += [False] * force6d_tokens.shape[1]
-
-        # Task + discretized State + "Action:" cue. Unchanged pretrained language string.
-        if obs.tokenized_prompt is not None:
-            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
-            tokens.append(tokenized_inputs)
-            input_mask.append(obs.tokenized_prompt_mask)
-            ar_mask += [False] * tokenized_inputs.shape[1]
 
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
@@ -458,8 +460,14 @@ class Pi0(_model.BaseModel):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
-    ) -> at.Float[at.Array, "*b ah"]:
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+        reduce_action_dim: bool = True,
+    ) -> at.Float[at.Array, "*b ah"] | at.Float[at.Array, "*b ah ad"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -481,8 +489,10 @@ class Pi0(_model.BaseModel):
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        mse = jnp.square(v_t - u_t)
+        if reduce_action_dim:
+            return jnp.mean(mse, axis=-1)
+        return mse
 
     @override
     def sample_actions(

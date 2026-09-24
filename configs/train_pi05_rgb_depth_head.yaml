@@ -52,7 +52,7 @@ data:
   assets:
     assets_dir: /REPLACE/ME/lerobot_ft_depth
     asset_id: "."
-  default_prompt: "REPLACE_ME"
+  default_prompt: "With both hands, pick up the yellow banana and the yellow lemon and put them into the black box; then take the green vegetables and place them into the blue box."
   prompt_from_task: true
   prompt_from_subtask: false
   # true：在 DEPTH HEAD 图 token 前插入 "DEPTH HEAD: "（不写进 Task）
@@ -61,3 +61,9 @@ data:
     cam_mid_depth: "DEPTH HEAD: "
   adapt_to_pi: false
   delta_action_dims: [7, 7, -1, -1]
+  # 两组归一化，不要给每个相机单独选：
+  #   visual_norm  RGB + DEPTH 同一套（SigLIP：uint8→[-1,1]）。DEPTH 毫米范围由 compute_norm_stats 的 q01/q99 决定；max_depth_mm 只在还没有 stats 时当后备。
+  #   vector_norm  state + action + FT 同一套。quantile=π0.5 默认；zscore=π0。
+  visual_norm: siglip
+  max_depth_mm: 4000.0  # 仅无 depth_mm stats 时的后备上限，不是训练时的硬裁
+  vector_norm: quantile

@@ -15,6 +15,7 @@ import tqdm
 import tyro
 
 import openpi.models.model as _model
+import openpi.policies.aloha_policy as aloha_policy
 import openpi.shared.normalize as normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
@@ -24,6 +25,32 @@ import openpi.transforms as transforms
 class RemoveStrings(transforms.DataTransformFn):
     def __call__(self, x: dict) -> dict:
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
+
+
+_DEPTH_STATS_MAX_PIXELS = 8192
+
+
+def _stats_pipeline_transforms(data_config: _config.DataConfig) -> list:
+    """Keep sidecar depths as mm so we can write depth_mm q01/q99.
+
+    DepthsAsSiglipImages would empty ``depths`` after mapping to 8-bit; skip it here.
+    """
+    inputs = [*data_config.repack_transforms.inputs]
+    for t in data_config.data_transforms.inputs:
+        if isinstance(t, aloha_policy.DepthsAsSiglipImages):
+            continue
+        inputs.append(t)
+    inputs.append(RemoveStrings())
+    return inputs
+
+
+def _valid_mm_sample(mm: np.ndarray) -> np.ndarray:
+    flat = np.asarray(mm, dtype=np.float32).reshape(-1)
+    valid = flat[np.isfinite(flat) & (flat > 0)]
+    if valid.size <= _DEPTH_STATS_MAX_PIXELS:
+        return valid
+    step = max(1, valid.size // _DEPTH_STATS_MAX_PIXELS)
+    return valid[::step][:_DEPTH_STATS_MAX_PIXELS]
 
 
 def create_torch_dataloader(
@@ -39,12 +66,7 @@ def create_torch_dataloader(
     dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
     dataset = _data_loader.TransformedDataset(
         dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-            RemoveStrings(),
-        ],
+        _stats_pipeline_transforms(data_config),
     )
     if max_frames is not None and max_frames < len(dataset):
         num_batches = max_frames // batch_size
@@ -71,12 +93,7 @@ def create_rlds_dataloader(
     dataset = _data_loader.create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=False)
     dataset = _data_loader.IterableTransformedDataset(
         dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-            RemoveStrings(),
-        ],
+        _stats_pipeline_transforms(data_config),
         is_batched=True,
     )
     if max_frames is not None and max_frames < len(dataset):
@@ -358,30 +375,55 @@ def main(
             data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
         )
 
-    # Only compute stats for state and actions
+    # state / action / FT 共用 vector_norm。DEPTH 像素不进 Normalize，但毫米 q01/q99
+    # 要写进同一份 json，给 DepthsAsSiglipImages 做 mm→8-bit。
     keys = ["state", "actions"]
     stats = {key: normalize.RunningStats() for key in keys}
+    force_stats: dict[str, normalize.RunningStats] = {}
+    depth_mm_stats: dict[str, normalize.RunningStats] = {}
 
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
         for key in keys:
             if key in batch:
                 stats[key].update(np.asarray(batch[key]))
+        force6d = batch.get("force6d")
+        if isinstance(force6d, dict):
+            for arm, vec in force6d.items():
+                name = f"force6d/{arm}"
+                if name not in force_stats:
+                    force_stats[name] = normalize.RunningStats()
+                arr = np.asarray(vec)
+                if arr.ndim == 1:
+                    arr = arr[None, ...]
+                force_stats[name].update(arr)
+        depths = batch.get("depths")
+        if isinstance(depths, dict):
+            for cam, depth_img in depths.items():
+                mm = aloha_policy.depth_array_to_mm(depth_img)
+                sample = _valid_mm_sample(mm)
+                if sample.size < 2:
+                    continue
+                name = f"depth_mm/{cam}"
+                if name not in depth_mm_stats:
+                    depth_mm_stats[name] = normalize.RunningStats()
+                depth_mm_stats[name].update(sample.reshape(-1, 1))
 
-    # Combine computed statistics
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
-
-    # Copy other keys from existing stats (excluding state and actions which must be recomputed)
-    excluded_keys = {"state", "actions"}
-    for key, value in existing_stats.items():
-        if key not in excluded_keys:
-            norm_stats[key] = value
-            print(f"Copied stats for key: {key}")
-
-    # Ensure state and actions are always recomputed (not copied from existing stats)
-    if "state" in existing_stats:
-        print("Note: 'state' stats were found in meta/stats.json but will be recomputed")
-    if "actions" in existing_stats:
-        print("Note: 'actions' stats were found in meta/stats.json but will be recomputed")
+    for name, running in force_stats.items():
+        norm_stats[name] = running.get_statistics()
+        print(f"Recomputed stats for key: {name}")
+    for name, running in depth_mm_stats.items():
+        try:
+            norm_stats[name] = running.get_statistics()
+        except ValueError as exc:
+            print(f"Skip {name}: {exc}")
+            continue
+        ns = norm_stats[name]
+        print(
+            f"Recomputed stats for key: {name}  "
+            f"q01={float(np.asarray(ns.q01).reshape(-1)[0]):.1f}mm  "
+            f"q99={float(np.asarray(ns.q99).reshape(-1)[0]):.1f}mm"
+        )
 
     print(f"Writing stats to: {output_path / 'norm_stats.json'}")
     print(f"Total keys in output: {len(norm_stats)}")

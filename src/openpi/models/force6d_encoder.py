@@ -35,19 +35,15 @@ class Force6DEncoder(nnx.Module):
         # Input dimension is 6 (6D force vector)
         input_dim = 6
         
-        # Build MLP layers
+        # String keys: nnx state + flax flatten_dict(sep="/") cannot join int indices.
         self.layers = {}
         if num_layers == 1:
-            # Single layer: direct projection
-            self.layers[0] = nnx.Linear(input_dim, output_dim, dtype=dtype, rngs=rngs)
+            self.layers["0"] = nnx.Linear(input_dim, output_dim, dtype=dtype, rngs=rngs)
         else:
-            # First layer: input -> hidden
-            self.layers[0] = nnx.Linear(input_dim, hidden_dim, dtype=dtype, rngs=rngs)
-            # Middle layers: hidden -> hidden
+            self.layers["0"] = nnx.Linear(input_dim, hidden_dim, dtype=dtype, rngs=rngs)
             for i in range(1, num_layers - 1):
-                self.layers[i] = nnx.Linear(hidden_dim, hidden_dim, dtype=dtype, rngs=rngs)
-            # Last layer: hidden -> output
-            self.layers[num_layers - 1] = nnx.Linear(hidden_dim, output_dim, dtype=dtype, rngs=rngs)
+                self.layers[str(i)] = nnx.Linear(hidden_dim, hidden_dim, dtype=dtype, rngs=rngs)
+            self.layers[str(num_layers - 1)] = nnx.Linear(hidden_dim, output_dim, dtype=dtype, rngs=rngs)
         
         # Layer norm for output
         self.layer_norm = nnx.LayerNorm(output_dim, dtype=dtype, rngs=rngs)

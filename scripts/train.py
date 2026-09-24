@@ -1,3 +1,7 @@
+import json
+import os
+from pathlib import Path
+
 import dataclasses
 import functools
 import logging
@@ -28,6 +32,93 @@ import openpi.training.sharding as sharding
 import openpi.training.train_log as _train_log
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+
+
+_DIM_NAMES = (
+    "L1",
+    "L2",
+    "L3",
+    "L4",
+    "L5",
+    "L6",
+    "L7",
+    "R1",
+    "R2",
+    "R3",
+    "R4",
+    "R5",
+    "R6",
+    "R7",
+    "Lgrip",
+    "Rgrip",
+)
+
+
+class ActionDimAbort(RuntimeError):
+    """Stats / pad / 坏基座门禁：停训不要继续。"""
+
+
+def _write_jax_loss_probe(checkpoint_dir, step, dim_mse, scalar_loss, extra=None) -> dict:
+    """Write TongBot action-dim probe. dim_mse is length action_dim (32)."""
+    dim = [float(x) for x in np.asarray(dim_mse).reshape(-1).tolist()]
+    n = len(dim)
+    real = dim[:16]
+    pad = dim[16:] if n > 16 else []
+    pad_mean = float(sum(pad) / len(pad)) if pad else 0.0
+    worst_i = int(max(range(len(real)), key=lambda i: real[i])) if real else 0
+    best_i = int(min(range(len(real)), key=lambda i: real[i])) if real else 0
+    rec = {
+        "step": int(step),
+        "loss": None if scalar_loss is None else round(float(scalar_loss), 5),
+        "dim_real": [round(v, 5) for v in real],
+        "dim_names": list(_DIM_NAMES),
+        "worst_dim": worst_i,
+        "best_dim": best_i,
+        "pad_mean": round(pad_mean, 5),
+        "verdict": "ok",
+    }
+    if extra:
+        rec.update(extra)
+    path = Path(checkpoint_dir) / "loss_probe.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return rec
+
+
+def _guard_action_dims(rec: dict, step: int, checkpoint_dir) -> None:
+    if step > 100:
+        return
+    real = rec.get("dim_real") or []
+    scalar = rec.get("loss")
+    pad_mean = rec.get("pad_mean")
+    reason = None
+    if any(v != v or v == float("inf") for v in real):
+        reason = "NaN/Inf in dim_real"
+    elif real and max(real) >= 5.0:
+        reason = f"worst dim_real={max(real):.3f} >= 5"
+    elif real and sorted(real)[len(real) // 2] > 0:
+        med = sorted(real)[len(real) // 2]
+        if max(real) / max(med, 1e-6) >= 8 and max(real) >= 1.0:
+            reason = f"worst/median >= 8 ({max(real):.3f}/{med:.3f})"
+    if pad_mean is not None and float(pad_mean) >= 0.1:
+        reason = f"pad_mean={pad_mean:.4f} >= 0.1 (cold action expert)"
+    if scalar is not None and float(scalar) >= 1.0:
+        reason = f"scalar loss={scalar:.4f} >= 1.0 (bad base)"
+    if not reason:
+        return
+    abort = {
+        "step": int(step),
+        "reason": reason,
+        "probe": rec,
+    }
+    ckpt = Path(checkpoint_dir)
+    (ckpt / "action_dim_abort.json").write_text(json.dumps(abort, indent=2, ensure_ascii=False), encoding="utf-8")
+    (ckpt / "action_dim_abort.md").write_text(
+        f"# ActionDimAbort step {step}\n\n{reason}\n\n见 `loss_probe.jsonl` / `action_dim_abort.json`。\n",
+        encoding="utf-8",
+    )
+    raise ActionDimAbort(reason)
 
 
 def init_logging():
@@ -154,15 +245,17 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        per_elem = model.compute_loss(rng, observation, actions, train=True, reduce_action_dim=False)
+        return jnp.mean(per_elem), {"dim_mse": jnp.mean(per_elem, axis=(0, 1))}
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, aux), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -194,6 +287,7 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        "dim_mse": aux["dim_mse"],
     }
     return new_state, info
 
@@ -294,8 +388,10 @@ def main(config: _config.TrainConfig):
         infos.append(info)
         if step % config.log_interval == 0 and infos:
             stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+            reduced_info = jax.device_get(jax.tree.map(lambda x: jnp.mean(x, axis=0), stacked_infos))
+            info_str = ", ".join(
+                f"{k}={float(v):.4f}" for k, v in reduced_info.items() if np.asarray(v).ndim == 0
+            )
             pbar.write(f"Step {step}: {info_str}")
             logging.info(
                 _train_log.format_metrics_line(
@@ -303,15 +399,41 @@ def main(config: _config.TrainConfig):
                     loss=reduced_info.get("loss"),
                     grad_norm=reduced_info.get("grad_norm"),
                     epoch=(step / steps_per_epoch) if steps_per_epoch else None,
-                    extra={
-                        k: v
-                        for k, v in reduced_info.items()
-                        if k not in {"loss", "grad_norm"}
-                    },
+            extra={
+                k: v
+                for k, v in reduced_info.items()
+                if k not in {"loss", "grad_norm", "dim_mse"}
+            },
                 )
             )
-            wandb.log(reduced_info, step=step)
+            wandb.log({k: v for k, v in reduced_info.items() if k != "dim_mse"}, step=step)
             if jax.process_index() == 0:
+                dim_mse = reduced_info.get("dim_mse")
+                if dim_mse is not None:
+                    rec = _write_jax_loss_probe(
+                        config.checkpoint_dir,
+                        step,
+                        dim_mse,
+                        reduced_info.get("loss"),
+                        extra={
+                            "grad_norm": float(reduced_info["grad_norm"])
+                            if reduced_info.get("grad_norm") is not None
+                            else None,
+                            "param_norm": float(reduced_info["param_norm"])
+                            if reduced_info.get("param_norm") is not None
+                            else None,
+                        },
+                    )
+                    logging.info(
+                        "PROBE step=%s loss=%s pad_mean=%s worst=%s/%s dim_real=%s",
+                        step,
+                        rec.get("loss"),
+                        rec.get("pad_mean"),
+                        rec.get("worst_dim"),
+                        _DIM_NAMES[rec["worst_dim"]] if rec.get("worst_dim") is not None else None,
+                        rec.get("dim_real"),
+                    )
+                    _guard_action_dims(rec, step, config.checkpoint_dir)
                 try:
                     loss_f = float(reduced_info.get("loss"))
                 except (TypeError, ValueError):
@@ -329,6 +451,8 @@ def main(config: _config.TrainConfig):
 
         is_last = step == config.num_train_steps - 1
         should_save = (step % config.save_interval == 0 and step > start_step) or is_last
+        if os.environ.get("OPENPI_SKIP_CKPT") == "1":
+            should_save = False
         if config.save_full_interval is not None:
             should_save = should_save or (
                 step % config.save_full_interval == 0 and step > start_step

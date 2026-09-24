@@ -911,6 +911,22 @@ def apply_tree(
     return unflatten_dict({k: transform(k, v) for k, v in tree.items()})
 
 
+_VECTOR_NORM_ROOTS = frozenset({"state", "actions", "force6d"})
+
+
+def filter_vector_norm_stats(norm_stats: at.PyTree[NormStats] | None) -> dict:
+    """只保留 state / actions / force6d。RGB 像素和 DEPTH 像素走 SigLIP，不进 Normalize。
+
+    ``depth_mm/<cam>`` 仍写在 norm_stats.json 里，给 DepthsAsSiglipImages 做 mm→8-bit，
+    这里故意丢掉，避免对 HxW 图跑向量归一化。
+    """
+    if not norm_stats:
+        return {}
+    flat = flatten_dict(norm_stats)
+    kept = {k: v for k, v in flat.items() if k.split("/")[0] in _VECTOR_NORM_ROOTS}
+    return unflatten_dict(kept)
+
+
 def pad_to_dim(x: np.ndarray, target_dim: int, axis: int = -1, value: float = 0.0) -> np.ndarray:
     """Pad an array to the target dimension with zeros along the specified axis."""
     current_dim = x.shape[axis]

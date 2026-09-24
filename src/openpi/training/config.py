@@ -82,7 +82,12 @@ class DataConfig:
     # Model specific transforms. Will be applied after the data is normalized.
     model_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
+    # TongBot YAML: 由 data.vector_norm 写入（quantile|zscore）。state / action / FT 共用。
     use_quantile_norm: bool = False
+    # RGB + DEPTH 共用。目前只支持 siglip（uint8 → [-1, 1]，预训练 Paligemma 合同）。
+    visual_norm: str = "siglip"
+    # state + action + force6d 共用。空=跟 use_quantile_norm；quantile=π0.5；zscore=π0。
+    vector_norm: str = ""
 
     # Names of keys that will be used by the data loader to generate the action sequence. The length of the
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
@@ -264,6 +269,14 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     append_modality_prompt: bool = False
     # YAML: data.modality_prompt_tags: {cam_left_depth: "DEPTH WRIST LEFT: "}
     modality_prompt_tags: dict[str, str] = dataclasses.field(default_factory=dict)
+    # YAML: data.visual_norm / data.vector_norm
+    # RGB 和 DEPTH 必须同一套；state 和 FT 必须同一套。不要给单路相机单独选。
+    visual_norm: Literal["siglip"] = "siglip"
+    # 仅当 norm_stats 里还没有 depth_mm/<cam> q01/q99 时，DEPTH 才按这个毫米上限拉成 8-bit。
+    # 有 stats 时用这盘有效像素分位（compute_norm_stats 写的），不是 4000 硬裁。
+    max_depth_mm: float = 4000.0
+    # quantile=π0.5 预训练；zscore=π0。作用于 state、action、force6d。
+    vector_norm: Literal["quantile", "zscore"] = "quantile"
     # If true, this will convert the joint and gripper values from the standard Aloha space to
     # the space used by the pi internal runtime which was used to train the base model. People who
     # use standard Aloha data should set this to true.
@@ -295,10 +308,17 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
         has_sidecar_depth = any(
             isinstance(t, aloha_policy.LoadSidecarDepthPNGs) for t in self.repack_transforms.inputs
         )
+        base = self.create_base_config(assets_dirs, model_config)
         if has_sidecar_depth:
-            # depth 走 SigLIP，不建独立 DepthEncoder
+            # depth 走 SigLIP，不建独立 DepthEncoder；和 RGB 共用 visual_norm。
+            # mm→8-bit 优先用这盘 depth_mm q01/q99，没有 stats 才退回 max_depth_mm。
             extra_inputs.append(aloha_policy.ProcessDepths())
-            extra_inputs.append(aloha_policy.DepthsAsSiglipImages())
+            extra_inputs.append(
+                aloha_policy.with_depth_mm_stats(
+                    aloha_policy.DepthsAsSiglipImages(max_depth_mm=self.max_depth_mm),
+                    base.norm_stats,
+                )
+            )
         elif getattr(model_config, "use_depth_encoder", False):
             extra_inputs.append(aloha_policy.ProcessDepths())
         if getattr(model_config, "use_force6d_encoder", False):
@@ -330,14 +350,21 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             if changed:
                 repack_transforms = dataclasses.replace(repack_transforms, inputs=tuple(patched))
 
+        if self.visual_norm != "siglip":
+            raise ValueError(f"visual_norm={self.visual_norm!r}；RGB/DEPTH 只支持 siglip（预训练 Paligemma 合同）")
+        if self.vector_norm not in ("quantile", "zscore"):
+            raise ValueError(f"vector_norm={self.vector_norm!r}；只支持 quantile 或 zscore")
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base,
             repack_transforms=repack_transforms,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
             prompt_from_task=self.prompt_from_task,
             prompt_from_subtask=self.prompt_from_subtask,
+            use_quantile_norm=self.vector_norm == "quantile",
+            visual_norm=self.visual_norm,
+            vector_norm=self.vector_norm,
         )
 
 
@@ -773,9 +800,11 @@ _TONGBOT_PROMPT_TAGS_BY_DEPTH: dict[str, dict[str, str]] = {
     "left": {"cam_left_depth": "DEPTH WRIST LEFT: "},
     "right": {"cam_right_depth": "DEPTH WRIST RIGHT: "},
 }
+# 盘上暂写成全称 FORCE TORQUE。2026-09-23 已开的 00108 FT 进程开训时吃的是
+# "FT LEFT: " / "FT RIGHT: "（不热加载）。推那批 ckpt 必须用旧文案，不要跟这份新字符串。
 _TONGBOT_PROMPT_TAGS_FT: dict[str, str] = {
-    "force6d.left": "FT LEFT: ",
-    "force6d.right": "FT RIGHT: ",
+    "force6d.left": "FORCE TORQUE LEFT: ",
+    "force6d.right": "FORCE TORQUE RIGHT: ",
 }
 
 
@@ -840,7 +869,8 @@ def _tongbot_modality_train_config(
                 assets_dir=_TONGBOT_FT_DEPTH_PLACEHOLDER,
                 asset_id=".",
             ),
-            default_prompt="null",
+            # 00108 与 00036 同一句；YAML data.default_prompt 可覆盖。prompt_from_task 仍读 tasks.jsonl。
+            default_prompt="With both hands, pick up the yellow banana and the yellow lemon and put them into the black box; then take the green vegetables and place them into the blue box.",
             adapt_to_pi=False,
             use_delta_joint_actions=True,
             # TongBot 16D: 左7 | 右7 | 左爪 abs | 右爪 abs

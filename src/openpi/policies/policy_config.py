@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import os
 import pathlib
@@ -6,6 +7,7 @@ from typing import Any
 import jax.numpy as jnp
 
 import openpi.models.model as _model
+import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
@@ -76,6 +78,20 @@ def create_trained_policy(
                 raise last_error
             raise FileNotFoundError(f"Norm stats not found next to {checkpoint_dir}")
 
+    # ckpt 里的 depth_mm q01/q99 必须和训练时同一套；不要退回 YAML 的 4000。
+    patched_inputs = []
+    changed_depth_range = False
+    for t in data_config.data_transforms.inputs:
+        if isinstance(t, aloha_policy.DepthsAsSiglipImages):
+            t = aloha_policy.with_depth_mm_stats(t, norm_stats)
+            changed_depth_range = True
+        patched_inputs.append(t)
+    if changed_depth_range:
+        data_config = dataclasses.replace(
+            data_config,
+            data_transforms=dataclasses.replace(data_config.data_transforms, inputs=tuple(patched_inputs)),
+        )
+
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:
         try:
@@ -91,12 +107,19 @@ def create_trained_policy(
             *repack_transforms.inputs,
             transforms.InjectDefaultPrompt(default_prompt),
             *data_config.data_transforms.inputs,
-            transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            transforms.Normalize(
+                transforms.filter_vector_norm_stats(norm_stats),
+                use_quantiles=data_config.use_quantile_norm,
+            ),
             *data_config.model_transforms.inputs,
         ],
         output_transforms=[
             *data_config.model_transforms.outputs,
-            transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm, strict=False),
+            transforms.Unnormalize(
+                transforms.filter_vector_norm_stats(norm_stats),
+                use_quantiles=data_config.use_quantile_norm,
+                strict=False,
+            ),
             *data_config.data_transforms.outputs,
             *repack_transforms.outputs,
         ],

@@ -35,7 +35,7 @@ EXPECTED = {
         "depth": "none",
         "ft": True,
         "keys": (),
-        "tags": {"force6d.left": "FT LEFT: ", "force6d.right": "FT RIGHT: "},
+        "tags": {"force6d.left": "FORCE TORQUE LEFT: ", "force6d.right": "FORCE TORQUE RIGHT: "},
     },
     "pi05_aloha_rgb_depth_head_ft": {
         "depth": "head",
@@ -43,8 +43,8 @@ EXPECTED = {
         "keys": ("observation.depths.cam_mid",),
         "tags": {
             "cam_mid_depth": "DEPTH HEAD: ",
-            "force6d.left": "FT LEFT: ",
-            "force6d.right": "FT RIGHT: ",
+            "force6d.left": "FORCE TORQUE LEFT: ",
+            "force6d.right": "FORCE TORQUE RIGHT: ",
         },
     },
     "pi05_aloha_rgb_depth_left_ft": {
@@ -53,8 +53,8 @@ EXPECTED = {
         "keys": ("observation.depths.cam_left",),
         "tags": {
             "cam_left_depth": "DEPTH WRIST LEFT: ",
-            "force6d.left": "FT LEFT: ",
-            "force6d.right": "FT RIGHT: ",
+            "force6d.left": "FORCE TORQUE LEFT: ",
+            "force6d.right": "FORCE TORQUE RIGHT: ",
         },
     },
     "pi05_aloha_rgb_depth_right_ft": {
@@ -63,8 +63,8 @@ EXPECTED = {
         "keys": ("observation.depths.cam_right",),
         "tags": {
             "cam_right_depth": "DEPTH WRIST RIGHT: ",
-            "force6d.left": "FT LEFT: ",
-            "force6d.right": "FT RIGHT: ",
+            "force6d.left": "FORCE TORQUE LEFT: ",
+            "force6d.right": "FORCE TORQUE RIGHT: ",
         },
     },
 }
@@ -116,6 +116,8 @@ def main() -> None:
         assert dict(cfg.model.modality_prompt_tags) == spec["tags"], (name, cfg.model.modality_prompt_tags)
         assert cfg.data.append_modality_prompt is False, name
         assert cfg.model.use_modality_prompt_tokens is False, name
+        assert cfg.data.visual_norm == "siglip", name
+        assert cfg.data.vector_norm == "quantile", name
         print(f"ok  {name:32s}  depth={spec['depth']:5s}  ft={spec['ft']}  tags={spec['tags']}")
 
     import pathlib
@@ -127,25 +129,25 @@ def main() -> None:
         "train_pi05_rgb_depth_head.yaml": (True, {"cam_mid_depth": "DEPTH HEAD: "}),
         "train_pi05_rgb_depth_left.yaml": (True, {"cam_left_depth": "DEPTH WRIST LEFT: "}),
         "train_pi05_rgb_depth_right.yaml": (True, {"cam_right_depth": "DEPTH WRIST RIGHT: "}),
-        "train_pi05_rgb_ft.yaml": (True, {"force6d.left": "FT LEFT: ", "force6d.right": "FT RIGHT: "}),
+        "train_pi05_rgb_ft.yaml": (True, {"force6d.left": "FORCE TORQUE LEFT: ", "force6d.right": "FORCE TORQUE RIGHT: "}),
         "train_pi05_rgb_depth_head_ft.yaml": (
             True,
-            {"cam_mid_depth": "DEPTH HEAD: ", "force6d.left": "FT LEFT: ", "force6d.right": "FT RIGHT: "},
+            {"cam_mid_depth": "DEPTH HEAD: ", "force6d.left": "FORCE TORQUE LEFT: ", "force6d.right": "FORCE TORQUE RIGHT: "},
         ),
         "train_pi05_rgb_depth_left_ft.yaml": (
             True,
             {
                 "cam_left_depth": "DEPTH WRIST LEFT: ",
-                "force6d.left": "FT LEFT: ",
-                "force6d.right": "FT RIGHT: ",
+                "force6d.left": "FORCE TORQUE LEFT: ",
+                "force6d.right": "FORCE TORQUE RIGHT: ",
             },
         ),
         "train_pi05_rgb_depth_right_ft.yaml": (
             True,
             {
                 "cam_right_depth": "DEPTH WRIST RIGHT: ",
-                "force6d.left": "FT LEFT: ",
-                "force6d.right": "FT RIGHT: ",
+                "force6d.left": "FORCE TORQUE LEFT: ",
+                "force6d.right": "FORCE TORQUE RIGHT: ",
             },
         ),
     }
@@ -154,8 +156,22 @@ def main() -> None:
         data = raw["data"]
         assert data["append_modality_prompt"] is flag, fname
         assert dict(data.get("modality_prompt_tags") or {}) == tags, fname
+        assert data["visual_norm"] == "siglip", fname
+        assert data["vector_norm"] == "quantile", fname
+        assert float(data["max_depth_mm"]) == 4000.0, fname
         print(f"ok  yaml {fname}")
 
+    rgb = config.get_config("pi05_aloha_rgb")
+    created = rgb.data.create(pathlib.Path("/tmp"), rgb.model)
+    assert created.visual_norm == "siglip"
+    assert created.vector_norm == "quantile"
+    assert created.use_quantile_norm is True
+    created_z = dataclasses.replace(rgb.data, vector_norm="zscore").create(pathlib.Path("/tmp"), rgb.model)
+    assert created_z.vector_norm == "zscore"
+    assert created_z.use_quantile_norm is False
+    print("ok  vector_norm quantile/zscore → use_quantile_norm")
+
+    _check_depth_mm_from_stats()
     _smoke_all_option_transforms()
     print("all 8 modality presets ok")
 
@@ -260,6 +276,61 @@ def _smoke_all_option_transforms() -> None:
         assert bool(out["force6d_mask"]["left"]) is False
         assert bool(out["force6d_mask"]["right"]) is True
         print("ok  transform ft nan mask")
+
+
+def _check_depth_mm_from_stats() -> None:
+    import tempfile
+    from pathlib import Path
+
+    from openpi.shared import normalize as normalize
+
+    mm = np.full((4, 4), 1500, dtype=np.uint16)
+    fallback = aloha_policy.DepthsAsSiglipImages(max_depth_mm=4000.0)
+    out = fallback({"depths": {"cam_mid": mm}})
+    fallback_u8 = int(out["images"]["cam_mid_depth"][0, 0, 0])
+    assert fallback_u8 == int(round(1500 / 4000 * 255)), fallback_u8
+
+    fitted = aloha_policy.DepthsAsSiglipImages(
+        max_depth_mm=4000.0,
+        mm_q01={"cam_mid": 500.0},
+        mm_q99={"cam_mid": 2500.0},
+    )
+    out = fitted({"depths": {"cam_mid": mm}})
+    fitted_u8 = int(out["images"]["cam_mid_depth"][0, 0, 0])
+    expect = int(round((1500 - 500) / (2500 - 500) * 255))
+    assert fitted_u8 == expect, (fitted_u8, expect)
+    assert fitted_u8 != fallback_u8
+    print("ok  depth mm q01/q99 mapping vs 4000 fallback")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        normalize.save(
+            root,
+            {
+                "depth_mm/cam_mid": normalize.NormStats(
+                    mean=np.array([1000.0]),
+                    std=np.array([200.0]),
+                    q01=np.array([500.0]),
+                    q99=np.array([2500.0]),
+                )
+            },
+        )
+        cfg = config.get_config("pi05_aloha_rgb_depth_head")
+        data = dataclasses.replace(
+            cfg.data,
+            repo_id=str(root),
+            assets=dataclasses.replace(cfg.data.assets, assets_dir=str(root), asset_id="."),
+        )
+        created = data.create(root, cfg.model)
+        depth_ts = [
+            t for t in created.data_transforms.inputs if isinstance(t, aloha_policy.DepthsAsSiglipImages)
+        ]
+        assert len(depth_ts) == 1, depth_ts
+        assert depth_ts[0].mm_q01.get("cam_mid") == 500.0, depth_ts[0].mm_q01
+        assert depth_ts[0].mm_q99.get("cam_mid") == 2500.0, depth_ts[0].mm_q99
+        kept = transforms.filter_vector_norm_stats(created.norm_stats)
+        assert "depth_mm" not in str(kept)
+        print("ok  create() wires depth_mm stats; Normalize filter drops them")
 
 
 if __name__ == "__main__":

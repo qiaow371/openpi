@@ -42,6 +42,39 @@ def create_sinusoidal_pos_embedding(
     return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
 
 
+def _encode_modality_tag_ids(tags: dict) -> dict[str, list[int]]:
+    """Paligemma ids for DEPTH/FT labels. Avoid importing tokenizer.py (pulls JAX)."""
+    if not tags:
+        return {}
+    import os
+    from pathlib import Path
+
+    import sentencepiece
+
+    import openpi.shared.download as download
+
+    env_path = os.environ.get("PALIGEMMA_TOKENIZER_PATH", "")
+    path = Path(env_path) if env_path else None
+    if path is None or not path.is_file():
+        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+    sp = sentencepiece.SentencePieceProcessor(model_file=str(path))
+    out: dict[str, list[int]] = {}
+    for key, text in tags.items():
+        cleaned = str(text).strip().replace("_", " ").replace("\n", " ")
+        if cleaned:
+            ids = list(sp.encode(cleaned, add_bos=False))
+            if ids:
+                out[str(key)] = ids
+    return out
+
+
+def _image_nchw(img: torch.Tensor) -> torch.Tensor:
+    """SigLIP wants [B, C, H, W]. Depth copies from the loader are often HWC."""
+    if img.ndim == 4 and img.shape[-1] in (1, 3) and img.shape[1] not in (1, 3):
+        return img.permute(0, 3, 1, 2)
+    return img
+
+
 def sample_beta(alpha, beta, bsize, device):
     alpha_t = torch.as_tensor(alpha, dtype=torch.float32, device=device)
     beta_t = torch.as_tensor(beta, dtype=torch.float32, device=device)
@@ -109,6 +142,23 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        self.force6d_encoder = None
+        if getattr(config, "use_force6d_encoder", False):
+            from openpi.models_pytorch.force6d_encoder import Force6DEncoder
+
+            # π0.5: FT tokens sit in prefix next to SigLIP/language (PaliGemma width).
+            self.force6d_encoder = Force6DEncoder(
+                output_dim=paligemma_config.width if self.pi05 else action_expert_config.width,
+                hidden_dim=getattr(config, "force6d_hidden_dim", 32),
+                num_layers=getattr(config, "force6d_num_layers", 2),
+            )
+
+        self._modality_prompt_ids: dict[str, torch.Tensor] = {}
+        if getattr(config, "use_modality_prompt_tokens", False):
+            tags = getattr(config, "modality_prompt_tags", None) or {}
+            for key, ids in _encode_modality_tag_ids(tags).items():
+                self._modality_prompt_ids[key] = torch.tensor(ids, dtype=torch.int64)
+
         torch.set_float32_matmul_precision("high")
         self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
 
@@ -160,15 +210,35 @@ class PI0Pytorch(nn.Module):
         return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
 
     def _preprocess_observation(self, observation, *, train=True):
-        """Helper method to preprocess observation."""
-        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
-        return (
-            list(observation.images.values()),
-            list(observation.image_masks.values()),
-            observation.tokenized_prompt,
-            observation.tokenized_prompt_mask,
-            observation.state,
-        )
+        """Keep image keys + force6d so embed_prefix can put extras after language."""
+        return _preprocessing.preprocess_observation_pytorch(observation, train=train)
+
+    def _append_modality_prompt(self, name, batch_size, device, embs, pad_masks, att_masks):
+        ids = self._modality_prompt_ids.get(name)
+        if ids is None or ids.numel() == 0:
+            return
+        ids = ids.to(device=device).unsqueeze(0).expand(batch_size, -1)
+
+        def lang_embed_func(lang_tokens):
+            lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
+            return lang_emb * math.sqrt(lang_emb.shape[-1])
+
+        tag_emb = self._apply_checkpoint(lang_embed_func, ids)
+        embs.append(tag_emb)
+        pad_masks.append(torch.ones(batch_size, tag_emb.shape[1], dtype=torch.bool, device=device))
+        att_masks += [0] * tag_emb.shape[1]
+
+    def _embed_named_image(self, img, img_mask, embs, pad_masks, att_masks):
+        img = _image_nchw(img)
+
+        def image_embed_func(image):
+            return self.paligemma_with_expert.embed_image(image)
+
+        img_emb = self._apply_checkpoint(image_embed_func, img)
+        bsize, num_img_embs = img_emb.shape[:2]
+        embs.append(img_emb)
+        pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+        att_masks += [0] * num_img_embs
 
     def sample_noise(self, shape, device):
         return torch.normal(
@@ -184,55 +254,62 @@ class PI0Pytorch(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
 
-    def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images with SigLIP and language tokens with embedding layer to prepare
-        for PaliGemma transformer processing.
+    def embed_prefix(self, obs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """RGB (pretrained slots) → Task/State/Action: → DEPTH/FT extras.
+
+        Same order as JAX pi0.embed_prefix. att_masks 0 = bidirectional prefix.
         """
         embs = []
         pad_masks = []
         att_masks = []
+        pretrained_rgb = set(_preprocessing.IMAGE_KEYS)
+        images = obs.images
+        image_masks = obs.image_masks
+        lang_tokens = obs.tokenized_prompt
+        lang_masks = obs.tokenized_prompt_mask
 
-        # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        for name in _preprocessing.IMAGE_KEYS:
+            if name not in images:
+                continue
+            self._embed_named_image(images[name], image_masks[name], embs, pad_masks, att_masks)
 
-            def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
-
-            img_emb = self._apply_checkpoint(image_embed_func, img)
-
-            bsize, num_img_embs = img_emb.shape[:2]
-
-            embs.append(img_emb)
-            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
-
-            # Create attention masks so that image tokens attend to each other
-            att_masks += [0] * num_img_embs
-
-        # Process language tokens
-        def lang_embed_func(lang_tokens):
-            lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
-            lang_emb_dim = lang_emb.shape[-1]
-            return lang_emb * math.sqrt(lang_emb_dim)
+        def lang_embed_func(tokens):
+            lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
+            return lang_emb * math.sqrt(lang_emb.shape[-1])
 
         lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
-
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
+        att_masks += [0] * lang_emb.shape[1]
 
-        # full attention between image and language inputs
-        num_lang_embs = lang_emb.shape[1]
-        att_masks += [0] * num_lang_embs
+        extra_names = [name for name in images if name not in pretrained_rgb]
+        for name in extra_names:
+            img = images[name]
+            self._append_modality_prompt(name, img.shape[0], img.device, embs, pad_masks, att_masks)
+            self._embed_named_image(img, image_masks[name], embs, pad_masks, att_masks)
+
+        if self.force6d_encoder is not None and getattr(obs, "force6d", None):
+            force6d = obs.force6d
+            force_masks = getattr(obs, "force6d_masks", None) or {}
+            for force_key in force6d:
+                vec = force6d[force_key]
+                self._append_modality_prompt(
+                    f"force6d.{force_key}", vec.shape[0], vec.device, embs, pad_masks, att_masks
+                )
+                encoded = self.force6d_encoder(vec)
+                token = encoded[:, None, :]
+                embs.append(token)
+                mask = force_masks.get(force_key)
+                if mask is None:
+                    mask = torch.ones(token.shape[0], dtype=torch.bool, device=token.device)
+                pad_masks.append(mask[:, None].expand(token.shape[0], token.shape[1]))
+                att_masks += [0] * token.shape[1]
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
-
-        # Get batch size from the first dimension of the concatenated tensors
         bsize = pad_masks.shape[0]
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
-
+        att_masks = att_masks[None, :].expand(bsize, att_masks.shape[0])
         return embs, pad_masks, att_masks
 
     def embed_suffix(self, state, noisy_actions, timestep):
@@ -316,7 +393,7 @@ class PI0Pytorch(nn.Module):
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        obs = self._preprocess_observation(observation, train=True)
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -328,8 +405,8 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(obs)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(obs.state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -381,9 +458,9 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        obs = self._preprocess_observation(observation, train=False)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(obs)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -407,7 +484,7 @@ class PI0Pytorch(nn.Module):
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
-                state,
+                obs.state,
                 prefix_pad_masks,
                 past_key_values,
                 x_t,

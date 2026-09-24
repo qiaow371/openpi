@@ -12,7 +12,11 @@ import urllib.parse
 import filelock
 import fsspec
 import fsspec.generic
-import tqdm_loggable.auto as tqdm
+
+try:
+    import tqdm_loggable.auto as tqdm
+except ImportError:  # Jiangsuan openpi_train image has no tqdm_loggable
+    import tqdm
 
 # Environment variable to control cache directory path, ~/.cache/openpi will be used by default.
 _OPENPI_DATA_HOME = "OPENPI_DATA_HOME"
